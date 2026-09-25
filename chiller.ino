@@ -13,13 +13,16 @@
     GPIO9   - 5V enable output
     GPIO2   - ADC: 12V current sense
     GPIO4   - Timer on/off input
-    GPIO0   - Switch position 1 input (OFF)
-    GPIO1   - Switch position 2 input (PUMP ONLY)
-    GPIO3   - Switch position 3 input (CHILLER ONLY)
-    GPIO10  - Switch position 4 input (BOTH)
+    GPIO0   - Switch position 1 input (OFF)        [active low, pull-up]
+    GPIO20  - Switch position 2 input (PUMP ONLY)  [active low, pull-up]
+    GPIO3   - Switch position 3 input (CHILLER ONLY) [active low, pull-up]
+    GPIO10  - Switch position 4 input (BOTH)       [active low, pull-up]
     LED_DATA_PIN - Addressable status LED data line (TODO: assign, see below)
 
   MODE LOGIC (from 4-position switch):
+    Switch inputs are ACTIVE LOW: a position is "active" when its pin is
+    pulled to GND by the switch, otherwise the internal pull-up holds it
+    HIGH. Position 1 is the default/off position.
     Position 1 (default) -> everything off
     Position 2 -> pump only (12V enable), compressor never requested
     Position 3 -> chiller only (compressor path); note the pump/12V-enable
@@ -84,8 +87,8 @@ const unsigned long WIFI_RETRY_INTERVAL_MS  = 30000;
 
 // Mode-select switch inputs (one-of-four rotary/slide switch)
 #define PIN_SWITCH_1   0   // position 1 - OFF (default)
-#define PIN_SWITCH_2   1   // position 2 - pump only
-#define PIN_SWITCH_3   3   // position 3 - chiller only
+#define PIN_SWITCH_2   20   // position 2 - pump only
+#define PIN_SWITCH_3   3  // position 3 - chiller only
 #define PIN_SWITCH_4   10  // position 4 - pump + chiller
 
 // Addressable status LEDs.
@@ -107,7 +110,7 @@ const uint8_t ADC_SAMPLE_COUNT = 8;     // simple averaging, tune later
 
 // Pump anti-short-cycle hold time. Pump stays on this long after demand
 // drops, so switching modes doesn't stop/restart it every time.
-const unsigned long PUMP_OFF_DELAY_MS = 30000; // TODO: tune to taste
+const unsigned long PUMP_OFF_DELAY_MS = 5000; // TODO: tune to taste
 
 // ============================ MODES / STATE ==============================
 enum ChillerMode {
@@ -188,11 +191,12 @@ void setup() {
   pinMode(PIN_ADC_12V, INPUT);
   pinMode(PIN_TIMER_IN, INPUT);    // TODO: confirm pull-up/pull-down and active level
 
-  // Mode-select switch inputs - TODO: confirm pull-up/pull-down and active level
-  pinMode(PIN_SWITCH_1, INPUT);
-  pinMode(PIN_SWITCH_2, INPUT);
-  pinMode(PIN_SWITCH_3, INPUT);
-  pinMode(PIN_SWITCH_4, INPUT);
+  // Mode-select switch inputs - ACTIVE LOW: the switch shorts the pin to GND
+  // to close its position, internal pull-up holds it HIGH when open.
+  pinMode(PIN_SWITCH_1, INPUT_PULLUP);
+  pinMode(PIN_SWITCH_2, INPUT_PULLUP);
+  pinMode(PIN_SWITCH_3, INPUT_PULLUP);
+  pinMode(PIN_SWITCH_4, INPUT_PULLUP);
 
   analogReadResolution(12); // 0-4095
 
@@ -319,13 +323,14 @@ void updatePumpOutput(bool pumpDemandNow, bool compressorNeedsPower) {
 }
 
 // =========================================================================
-// MODE-SELECT SWITCH INPUTS - pseudo, TODO: confirm active level / debounce
+// MODE-SELECT SWITCH INPUTS - ACTIVE LOW (switch closes to GND), internal
+// pull-ups enabled in setup(). TODO: add debounce on position change.
 // =========================================================================
 void readSwitchInputs() {
-  switch1State = (digitalRead(PIN_SWITCH_1) == HIGH); // TODO: confirm active level
-  switch2State = (digitalRead(PIN_SWITCH_2) == HIGH); // TODO: confirm active level
-  switch3State = (digitalRead(PIN_SWITCH_3) == HIGH); // TODO: confirm active level
-  switch4State = (digitalRead(PIN_SWITCH_4) == HIGH); // TODO: confirm active level
+  switch1State = (digitalRead(PIN_SWITCH_1) == LOW);
+  switch2State = (digitalRead(PIN_SWITCH_2) == LOW);
+  switch3State = (digitalRead(PIN_SWITCH_3) == LOW);
+  switch4State = (digitalRead(PIN_SWITCH_4) == LOW);
 }
 
 ChillerMode getSwitchMode() {

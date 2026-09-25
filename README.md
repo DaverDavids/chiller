@@ -17,10 +17,10 @@ a web UI for live status and manual function testing.
 | 9    | 5V enable output                      | HIGH |
 | 2    | ADC - 12V current sense (input)       | n/a |
 | 4    | Timer on/off input                    | n/a |
-| 0    | Switch position 1 - OFF (default)     | n/a |
-| 1    | Switch position 2 - pump only          | n/a |
-| 3    | Switch position 3 - chiller only       | n/a |
-| 10   | Switch position 4 - pump + chiller     | n/a |
+| 0    | Switch position 1 - OFF (default), active low | n/a |
+| 20   | Switch position 2 - pump only, active low       | n/a |
+| 3    | Switch position 3 - chiller only, active low    | n/a |
+| 10   | Switch position 4 - pump + chiller, active low  | n/a |
 | LED_DATA_PIN (placeholder GPIO20) | Addressable status LED data | n/a |
 
 GPIO budget note: every GPIO 0-10 is now assigned. `LED_DATA_PIN` is a
@@ -29,6 +29,11 @@ matches how you wire Serial vs USB on your board, or free one up by moving
 a lower-priority signal.
 
 ## Mode switch behavior
+
+The 4-position switch inputs are **active low**: the switch shorts the pin
+to GND to close a position, and the ESP32's internal pull-up holds it HIGH
+when that position is open. All four switch pins are configured as
+`INPUT_PULLUP`. So "active" in the code and in `/status` means *low*.
 
 A 4-position switch selects one of:
 
@@ -124,7 +129,8 @@ the top of `chiller.ino`.
 - `COMPRESSOR_SAFE_ADC_MAX` placeholder (500) needs calibration against the
   real capacitor charge curve.
 - Precharge timeout and real fault-state handling in `runStateMachine()`.
-- Active level / debounce for the timer input and all 4 switch inputs.
+- Active level / debounce for the timer input (switch inputs are confirmed
+  active low; debounce still outstanding).
 - Confirm whether the timer input should gate/AND with the switch mode for
   compressor demand, or be removed/repurposed now that the switch exists.
 - `LED_DATA_PIN` and `LED_COUNT` are placeholders - assign a real pin (GPIO
