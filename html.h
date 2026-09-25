@@ -33,6 +33,7 @@ const char PAGE_STATUS[] PROGMEM = R"====(
   td { padding: 4px 6px; border-bottom: 1px solid #ddd; }
   .ok { color: green; font-weight: bold; }
   .bad { color: #b00; font-weight: bold; }
+  .gpio { color: #777; font-family: monospace; font-size: 11px; white-space: nowrap; }
   button { margin: 2px; padding: 6px 10px; }
   h3 { margin-top: 24px; }
 </style>
@@ -51,7 +52,7 @@ const char PAGE_STATUS[] PROGMEM = R"====(
 <button onclick="testCall('/test/buzzer?state=off')">Off</button>
 <button onclick="testCall('/test/buzzer?state=auto')">Auto</button>
 
-<h3>Compressor demand test (still safety-gated by ADC)</h3>
+<h3>Compressor demand test (still safety-gated by the capacitor interlock)</h3>
 <button onclick="testCall('/test/compressor?state=on')">Request On</button>
 <button onclick="testCall('/test/compressor?state=off')">Request Off</button>
 <button onclick="testCall('/test/compressor?state=auto')">Auto (switch-controlled)</button>
@@ -61,8 +62,8 @@ function testCall(url) {
   fetch(url).then(refresh);
 }
 
-function row(label, value) {
-  return '<tr><td>' + label + '</td><td>' + value + '</td></tr>';
+function row(label, value, pin) {
+  return '<tr><td>' + label + (pin ? ' <span class="gpio">' + pin + '</span>' : '') + '</td><td>' + value + '</td></tr>';
 }
 
 function boolCell(v) {
@@ -72,17 +73,24 @@ function boolCell(v) {
 function refresh() {
   fetch('/status').then(r => r.json()).then(d => {
     let html = '';
+    let p = d.pins || {};
     html += row('Mode', d.mode);
     html += row('State', d.state);
-    html += row('ADC (12V sense)', d.adc + ' / limit ' + d.adcLimit + (d.safe ? ' <span class="ok">SAFE</span>' : ' <span class="bad">UNSAFE</span>'));
-    html += row('Fan', boolCell(d.fan) + (d.testFanActive ? ' (manual)' : ''));
-    html += row('Buzzer', boolCell(d.buzzer) + (d.testBuzzerActive ? ' (manual)' : ''));
-    html += row('Pump / 12V enable', boolCell(d.pump12v) + (d.pumpOffHold ? ' (hold-off delay active)' : ''));
-    html += row('Compressor', boolCell(d.compressor) + (d.testCompressorActive ? ' (manual demand)' : ''));
-    html += row('Switch 1 (Off)', boolCell(d.switch1));
-    html += row('Switch 2 (Pump only)', boolCell(d.switch2));
-    html += row('Switch 3 (Chiller only)', boolCell(d.switch3));
-    html += row('Switch 4 (Both)', boolCell(d.switch4));
+    html += row('Cap sequence', d.capSeq + ' (armed: ' + (d.capArmed ? 'yes' : 'no') + ')');
+    html += row('Capacitor', d.capAdc + ' &middot; needs &le;' + d.capDischargedMax +
+                ' to arm, &ge;' + d.capChargedMin + ' to close', p.capSense);
+    html += row('Cap charge out', boolCell(d.capCharge), p.capCharge);
+    html += row('12V current', d.currentAdc + ' / limit ' + d.currentLimit +
+                (d.currentSafe ? ' <span class="ok">SAFE</span>' : ' <span class="bad">OVERCURRENT</span>'), p.currentSense);
+    html += row('Fault', d.fault ? '<span class="bad">LATCHED</span>' : '<span>none</span>');
+    html += row('Fan', boolCell(d.fan) + (d.testFanActive ? ' (manual)' : ''), p.fan);
+    html += row('Buzzer', boolCell(d.buzzer) + (d.testBuzzerActive ? ' (manual)' : ''), p.buzzer);
+    html += row('12V enable (pump)', boolCell(d.enable12v) + (d.enable12vHold ? ' (hold-off delay active)' : ''), p.enable12v);
+    html += row('Compressor', boolCell(d.compressor) + (d.testCompressorActive ? ' (manual demand)' : ''), p.compressor);
+    html += row('Switch 1 (Off)', d.switch1 ? boolCell(true) : 'not wired', p.switch1);
+    html += row('Switch 2 (Pump only)', boolCell(d.switch2), p.switch2);
+    html += row('Switch 3 (Chiller only)', boolCell(d.switch3), p.switch3);
+    html += row('Switch 4 (Both)', boolCell(d.switch4), p.switch4);
     document.getElementById('statusTable').innerHTML = html;
   }).catch(() => {});
 }
