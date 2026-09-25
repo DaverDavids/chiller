@@ -15,6 +15,10 @@ fallback, OTA updates, mDNS, and flash-persisted settings.
 | 9    | 5V enable output                      | HIGH |
 | 2    | ADC - 12V current sense (input)       | n/a |
 | 4    | Timer on/off input                    | n/a |
+| 0    | Switch position 1 input (placeholder, can be reassigned) | n/a |
+| 1    | Switch position 2 input (placeholder, can be reassigned) | n/a |
+| 3    | Switch position 3 input (placeholder, can be reassigned) | n/a |
+| 10   | Switch position 4 input (placeholder, can be reassigned) | n/a |
 
 ## Safety design
 
@@ -27,6 +31,14 @@ cannot keep the compressor on longer than the safety condition allows.
 
 Do not add any other `digitalWrite(PIN_COMPRESSOR, ...)` calls anywhere else
 in the sketch -- all compressor control must go through this single gate.
+
+## Switch position inputs
+
+Four digital inputs (`PIN_SWITCH_1..4`) are read each loop by
+`readSwitchInputs()` into `switch1State..switch4State`. These currently sit
+on GPIO0, 1, 3, and 10 as placeholders -- reassign them once the final
+pinout/wiring is decided, and confirm active level / debounce / pull-up vs
+pull-down requirements. They are not yet wired into any control logic.
 
 ## Networking
 
@@ -51,6 +63,7 @@ in the sketch -- all compressor control must go through this single gate.
 
 - `COMPRESSOR_SAFE_ADC_MAX` placeholder value (500) needs to be calibrated against the real capacitor charge curve.
 - Precharge timeout and fault-state handling in `runStateMachine()`.
-- Active level / debounce for the timer input (GPIO4).
-- Live values (ADC, state, output status) in the status web page.
+- Active level / debounce for the timer input (GPIO4) and the 4 switch position inputs (GPIO0/1/3/10).
+- Reassign switch position GPIOs if 0/1/3/10 conflict with strapping/USB/boot requirements on the final board.
+- Live values (ADC, state, output status, switch states) in the status web page.
 - Manual test controls (fan/buzzer/compressor) on the web UI.

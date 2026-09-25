@@ -11,6 +11,10 @@
     GPIO9  - 5V enable output
     GPIO2  - ADC: 12V current sense
     GPIO4  - Timer on/off input
+    GPIO0  - Switch position 1 input (placeholder, can be reassigned)
+    GPIO1  - Switch position 2 input (placeholder, can be reassigned)
+    GPIO3  - Switch position 3 input (placeholder, can be reassigned)
+    GPIO10 - Switch position 4 input (placeholder, can be reassigned)
 
   SAFETY NOTE: PIN_COMPRESSOR is written in exactly one place,
   setCompressorOutput(), which re-checks the ADC every single call.
@@ -54,6 +58,13 @@ const unsigned long WIFI_RETRY_INTERVAL_MS  = 30000;
 #define PIN_ADC_12V    2   // ADC1 channel, 12V current-sense
 #define PIN_TIMER_IN   4   // timer on/off input
 
+// Switch position inputs - placeholder pins on remaining free GPIO,
+// reassign later once final pinout/wiring is decided.
+#define PIN_SWITCH_1   0   // switch position 1
+#define PIN_SWITCH_2   1   // switch position 2
+#define PIN_SWITCH_3   3   // switch position 3
+#define PIN_SWITCH_4   10  // switch position 4
+
 // ==================== SAFETY THRESHOLDS (PSEUDO/TODO) ====================
 // Compressor is allowed ON only when adcValue <= COMPRESSOR_SAFE_ADC_MAX.
 // TODO: calibrate against the real capacitor charge curve on the bench.
@@ -71,6 +82,12 @@ ChillerState state = STATE_IDLE;
 
 bool compressorRequested = false;  // demand flag only, NEVER write the pin from here
 
+// Switch position states, updated each loop by readSwitchInputs()
+bool switch1State = false;
+bool switch2State = false;
+bool switch3State = false;
+bool switch4State = false;
+
 Preferences prefs;
 WebServer server(80);
 DNSServer dnsServer;
@@ -85,6 +102,7 @@ int  readCompressorSafetyADC();
 bool isSafeToRunCompressor();
 void setCompressorOutput(bool wantOn);
 void runStateMachine();
+void readSwitchInputs();
 void connectWiFi();
 void startCaptivePortal();
 void handleRoot();
@@ -104,6 +122,13 @@ void setup() {
   pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);   // default HIGH per spec
   pinMode(PIN_ADC_12V, INPUT);
   pinMode(PIN_TIMER_IN, INPUT);    // TODO: confirm pull-up/pull-down and active level
+
+  // Switch position inputs - TODO: confirm pull-up/pull-down and active level,
+  // and finalize which physical GPIO each position maps to.
+  pinMode(PIN_SWITCH_1, INPUT);
+  pinMode(PIN_SWITCH_2, INPUT);
+  pinMode(PIN_SWITCH_3, INPUT);
+  pinMode(PIN_SWITCH_4, INPUT);
 
   analogReadResolution(12); // 0-4095
 
@@ -127,6 +152,9 @@ void loop() {
 
   // ---- timer input -> demand flag (does not touch the compressor pin) ----
   compressorRequested = (digitalRead(PIN_TIMER_IN) == HIGH); // TODO: confirm active level
+
+  // ---- switch position inputs ----
+  readSwitchInputs();
 
   // ---- sequencing / fault state machine (pseudo, fill in later) ----
   runStateMachine();
@@ -173,6 +201,17 @@ void setCompressorOutput(bool wantOn) {
   } else {
     digitalWrite(PIN_COMPRESSOR, LOW);   // any unsafe condition forces OFF immediately
   }
+}
+
+// =========================================================================
+// SWITCH POSITION INPUTS - pseudo, TODO: confirm active level / debounce
+// =========================================================================
+void readSwitchInputs() {
+  switch1State = (digitalRead(PIN_SWITCH_1) == HIGH); // TODO: confirm active level
+  switch2State = (digitalRead(PIN_SWITCH_2) == HIGH); // TODO: confirm active level
+  switch3State = (digitalRead(PIN_SWITCH_3) == HIGH); // TODO: confirm active level
+  switch4State = (digitalRead(PIN_SWITCH_4) == HIGH); // TODO: confirm active level
+  // TODO: use these states to drive mode selection / setpoints once defined
 }
 
 // =========================================================================
@@ -266,7 +305,7 @@ void handleRoot() {
   if (apMode) {
     server.send(200, "text/html", PAGE_CONFIG);
   } else {
-    // TODO: template in live values (ADC reading, state, output states, etc.)
+    // TODO: template in live values (ADC reading, state, output states, switch states, etc.)
     server.send(200, "text/html", PAGE_STATUS);
   }
 }
