@@ -9,12 +9,12 @@
     GPIO7  - 12V enable output (charges pre-charge capacitor)
     GPIO8  - Compressor output (gated ONLY by isSafeToRunCompressor())
     GPIO9  - 5V enable output
-    GPIO2  - ADC: 12V current sense
+    GPIO0  - ADC: 12V current sense
     GPIO4  - Timer on/off input
-    GPIO0  - Switch position 1 input (placeholder, can be reassigned)
-    GPIO1  - Switch position 2 input (placeholder, can be reassigned)
+    GPIO21  - Switch position 1 input (placeholder, can be reassigned)
+    GPIO20  - Switch position 2 input (placeholder, can be reassigned)
     GPIO3  - Switch position 3 input (placeholder, can be reassigned)
-    GPIO10 - Switch position 4 input (placeholder, can be reassigned)
+    GPIO2 - Switch position 4 input (placeholder, can be reassigned)
 
   SAFETY NOTE: PIN_COMPRESSOR is written in exactly one place,
   setCompressorOutput(), which re-checks the ADC every single call.
@@ -55,15 +55,15 @@ const unsigned long WIFI_RETRY_INTERVAL_MS  = 30000;
 #define PIN_12V_EN     7   // also charges pre-charge capacitor
 #define PIN_COMPRESSOR 8
 #define PIN_5V_EN      9
-#define PIN_ADC_12V    2   // ADC1 channel, 12V current-sense
+#define PIN_ADC_12V    0   // ADC1 channel, 12V current-sense
 #define PIN_TIMER_IN   4   // timer on/off input
 
 // Switch position inputs - placeholder pins on remaining free GPIO,
 // reassign later once final pinout/wiring is decided.
-#define PIN_SWITCH_1   0   // switch position 1
-#define PIN_SWITCH_2   1   // switch position 2
+#define PIN_SWITCH_1   21   // switch position 1
+#define PIN_SWITCH_2   20   // switch position 2
 #define PIN_SWITCH_3   3   // switch position 3
-#define PIN_SWITCH_4   10  // switch position 4
+#define PIN_SWITCH_4   2  // switch position 4
 
 // ==================== SAFETY THRESHOLDS (PSEUDO/TODO) ====================
 // Compressor is allowed ON only when adcValue <= COMPRESSOR_SAFE_ADC_MAX.
