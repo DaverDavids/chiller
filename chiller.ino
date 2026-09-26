@@ -596,19 +596,27 @@ void updateCompressorInterlock(bool wantCompressor) {
         break;
       }
 
-      digitalWrite(PIN_CAP_CHARGE, HIGH);
-
       // Bound the entire charging phase, not just the "not charged yet" part,
       // so the charge output can never be left energized indefinitely if the
       // contacts refuse to close - e.g. the capacitor reads charged but the
       // 12V sense stays overcurrent. Latch a fault instead of sitting here.
+      //
+      // Checked BEFORE the charge output is set HIGH, and parked LOW on the
+      // trip, so the pin state is deterministic within this same iteration
+      // rather than waiting for the next loop to clear it - the same invariant
+      // the demand-lost branch above relies on. The charge output is never
+      // energized on the iteration that gives up.
       if (millis() - capChargeStart >= PRECHARGE_TIMEOUT_MS) {
+        digitalWrite(PIN_CAP_CHARGE, LOW);
+        capSeq = CAP_SEQ_WAIT_DISCHARGE;
         compressorFault = true;
         DBG_PRINTF("[FAULT] contacts did not close in %lums: cap=%d (need >=%d) currentSafe=%d\n",
                    (unsigned long)PRECHARGE_TIMEOUT_MS, cap, CAP_CHARGED_ADC_MIN,
                    is12VCurrentSafe() ? 1 : 0);
         break;
       }
+
+      digitalWrite(PIN_CAP_CHARGE, HIGH);
 
       if (cap >= CAP_CHARGED_ADC_MIN && is12VCurrentSafe()) {
         // Capacitor proven charged AND the 12V sense clear of overcurrent -
