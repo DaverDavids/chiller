@@ -270,6 +270,18 @@ int CAP_CHARGED_ADC_MIN   = 3000; // at/above this the capacitor counts as
 // The two overlap on purpose: while the compressor runs the reading includes
 // the fan's baseline, so the ceiling has to sit above that baseline or the pump
 // would be cut for the fan's sake. Calibrate both against a meter.
+//
+// ZERO DISABLES either check, and both are settable from the web UI. That is the
+// calibration escape hatch: with the sense line's offset and gain unknown, a
+// guessed threshold would either trip constantly or never trip, and a pump that
+// gets cut every few seconds is impossible to measure. Setting a threshold to 0
+// turns its check into a pure readout so the real numbers can be captured first.
+//
+// The two are NOT treated the same way on reboot, on purpose:
+//   - The pump ceiling is a real protection that cuts a load, so 0 is never
+//     written to flash. A power cycle always brings it back armed.
+//   - The fan floor only raises a fault, it never cuts anything, and its shipped
+//     default is already 0, so 0 persists normally.
 int PUMP_STALL_ADC_MAX = 500;           // placeholder, 0-4095 (12-bit ADC)
 int FAN_RUN_ADC_MIN    = 0;             // 0 = fan check disabled, see above
 const uint8_t ADC_SAMPLE_COUNT = 8;     // simple averaging, tune later
@@ -522,11 +534,13 @@ bool switch4State = false;
 // timer pulls the pin LOW while its contact is closed, i.e. while the timer is
 // running, and that is the only thing that permits any output to start.
 //
-// systemEnableState is the debounced pin reading. systemEnableLostAt is stamped
-// the moment that reading goes from enabled to idle, and is 0 whenever no
-// restart window is pending. See updateSystemEnable() and applyMode().
+// systemEnableState is the debounced pin reading. The restart window is a
+// SEPARATE, explicitly boolean flag rather than a millis() sentinel, so an
+// expiry is unambiguous and cannot collide with a real timestamp. See
+// updateSystemEnable() and applyMode().
 bool systemEnableState = false;
-unsigned long systemEnableLostAt = 0;
+bool systemEnableWindowOpen = false;
+unsigned long systemEnableWindowStart = 0;
 
 // True only on the loops where a mode switch position was actually accepted as
 // new, so the click and the enable-hold re-arm fire once per movement instead of
@@ -568,6 +582,7 @@ bool readSystemEnableActive();
 void updateSystemEnable();
 bool systemAllowsRun();
 unsigned long systemEnableHoldRemaining();
+bool anyLoadActive();
 void buzzOnce(unsigned long durationMs, bool isModeStart);
 bool buzzRunning();
 ChillerMode getSwitchMode();
@@ -658,6 +673,18 @@ void setup() {
   statusLeds.begin();
   statusLeds.show(); // all off at boot
 
+  // Report the system enable level immediately, before anything can act on it.
+  // This is the single most useful line for confirming the polarity is right: if
+  // the enable is NOT connected and this reads "ENABLED", the pin is being pulled
+  // low by something on the board, or the active level is the wrong way round.
+  // Nothing can start on a false reading here, because the interlock still waits
+  // for a discharged capacitor - but it is worth catching at boot rather than
+  // inferring it later from a load that came on.
+  DBG_PRINTF("[ENABLE] GPIO%d raw=%s -> %s (active LOW: contact closed = enabled)\n",
+             PIN_SYSTEM_ENABLE,
+             digitalRead(PIN_SYSTEM_ENABLE) == LOW ? "LOW " : "HIGH",
+             readSystemEnableActive() ? "ENABLED" : "disabled");
+
   loadSettings();
 
   // Non-blocking first attempt - serviceWifi() in loop() drives it to
@@ -681,6 +708,13 @@ void loop() {
 
   // ---- fault latch / display state, derived from the interlock ----
   runStateMachine();
+
+  // ---- sample the 12V sense ONCE, before either consumer below ----
+  // Both the interlock's fan check and the pump's stall cut read the single
+  // value set here, and the peak hold and web UI report that same number. This
+  // must stay ahead of updateCompressorInterlock(), or the fan check would
+  // compare against the PREVIOUS loop's sample.
+  sampleCurrentAdc();
 
   // ---- SAFETY CRITICAL PATH: runs every loop iteration, never blocked ----
   // Sole owner of the charge output and the compressor output.
@@ -731,35 +765,69 @@ int read12VCurrentADC() {
   return readADC(PIN_ADC_12V);
 }
 
+// ---- calibration capture ---------------------------------------------------
+// Peak hold on the 12V sense, retained until explicitly reset. A pump stall is a
+// FAST event: the averaged sample may only cross the threshold for a handful of
+// loops, so the number that actually tripped it is gone by the time anyone opens
+// the web page. Holding the min and max lets the transient be characterised
+// afterwards, which is what makes the sense line calibratable at all.
+int  calCurrentAdcMin   = ADC_FULL_SCALE;
+int  calCurrentAdcMax   = 0;
+bool calCurrentAdcSeen   = false;
+
+void resetCurrentAdcCapture() {
+  calCurrentAdcMin = ADC_FULL_SCALE;
+  calCurrentAdcMax = 0;
+  calCurrentAdcSeen = false;
+}
+
+// The 12V sense is sampled ONCE per loop and the result shared, so the value the
+// protection compares against, the value the peak hold records and the value the
+// UI reports are all the same sample. Sampling it more than once could show a
+// number on the page that is not the one that tripped.
+int currentAdcValue = 0;
+
+void sampleCurrentAdc() {
+  currentAdcValue = read12VCurrentADC();
+  if (!calCurrentAdcSeen) {
+    calCurrentAdcMin = currentAdcValue;
+    calCurrentAdcMax = currentAdcValue;
+    calCurrentAdcSeen = true;
+    return;
+  }
+  if (currentAdcValue < calCurrentAdcMin) calCurrentAdcMin = currentAdcValue;
+  if (currentAdcValue > calCurrentAdcMax) calCurrentAdcMax = currentAdcValue;
+}
+
 // Overcurrent gate on the 12V sense line. Higher reading == more current.
-// A start may not proceed, and a running compressor may not stay closed,
-// while this is false.
 // True when the 12V rail is drawing more than the pump stall ceiling - i.e. the
-// pump is jammed or shorted. This is a PUMP fault. It says nothing about the
-// compressor, which is interlocked by its capacitor, so it must never gate the
-// compressor contacts either way.
+// pump is jammed or shorted. This is a PUMP fault and it gates the PUMP only. It
+// says nothing about the compressor, which is interlocked by its capacitor, so it
+// must never gate the compressor contacts either way.
+// A ceiling of 0 DISABLES the check, so the pump cannot be cut while the sense
+// line is being calibrated. 0 is never persisted (see handleSetCurrentLimit), so
+// a reboot always comes back with the protection armed.
 bool is12VOvercurrent() {
-  int adcValue = read12VCurrentADC();
-  bool over = (adcValue > PUMP_STALL_ADC_MAX);
+  if (PUMP_STALL_ADC_MAX <= 0) return false; // disabled by deliberate choice
+  bool over = (currentAdcValue > PUMP_STALL_ADC_MAX);
 
   static unsigned long lastPrint = 0;
   if (over || millis() - lastPrint >= DEBUG_PRINT_INTERVAL_MS) {
     DBG_PRINTF("[CURRENT] adc=%d stallMax=%d overcurrent=%d\n",
-               adcValue, PUMP_STALL_ADC_MAX, over ? 1 : 0);
+               currentAdcValue, PUMP_STALL_ADC_MAX, over ? 1 : 0);
     lastPrint = millis();
   }
   return over;
 }
 
 // True when the rail current is at or above the fan floor, i.e. the fan is
-// pulling current and so is turning. A 0 floor means "not measured yet": no
-// reading can be below 0, so this is unconditionally true and the check stays
-// inert until FAN_RUN_ADC_MIN is calibrated. Deliberately returns a bool rather
-// than comparing inline at the call site, so the disabled case is one obvious
-// place to look.
+// pulling current and so is turning. A floor of 0 DISABLES the check, so the
+// line becomes a pure readout while the floor is being measured. Deliberately
+// returns a bool rather than comparing inline at the call site, so the disabled
+// case is one obvious place to look.
 bool isFanDrawingCurrent() {
   if (FAN_RUN_ADC_MIN <= 0) return true; // disabled until measured
-  return read12VCurrentADC() >= FAN_RUN_ADC_MIN;
+  return currentAdcValue >= FAN_RUN_ADC_MIN;
 }
 
 // =========================================================================
@@ -1191,28 +1259,52 @@ bool readSystemEnableActive() {
   return digitalRead(PIN_SYSTEM_ENABLE) == LOW;
 }
 
-// How much of the restart window is left, in ms. 0 when the timer is enabled or
-// when no window is pending.
+// How much of the restart window is left, in ms. 0 when the timer is enabled, or
+// when no window is open. Expired windows are closed here so a later switch move
+// cannot resurrect one.
 unsigned long systemEnableHoldRemaining() {
-  if (systemEnableLostAt == 0) return 0;
-  unsigned long elapsed = millis() - systemEnableLostAt;
-  if (elapsed >= SYSTEM_ENABLE_HOLD_MS) return 0;
+  if (!systemEnableWindowOpen) return 0;
+  unsigned long elapsed = millis() - systemEnableWindowStart;
+  if (elapsed >= SYSTEM_ENABLE_HOLD_MS) {
+    systemEnableWindowOpen = false;
+    return 0;
+  }
   return SYSTEM_ENABLE_HOLD_MS - elapsed;
+}
+
+// Is any real load actually energised right now? Decides whether the restart
+// window has a live run to sustain. Read from the OUTPUT pins rather than from
+// the demand flags, because the demand flags are what the window is about to
+// influence - asking them would be circular. The pins are one loop stale at this
+// point in the cycle, which is irrelevant for a 2 minute window.
+bool anyLoadActive() {
+  return compressorRunning || (digitalRead(PIN_12V_EN) == HIGH);
 }
 
 // Owns the restart window. Called every loop before applyMode().
 //
-// The window opens when the timer's contact opens (the timer stops) and holds
-// the demand up for SYSTEM_ENABLE_HOLD_MS so the user can wind the timer or move
-// the mode switch to pick the run back up. Two things close or re-arm it:
+// CRITICAL: the window can only SUSTAIN a run that was already happening. It can
+// never authorise a new start. The enable opening while the machine is already
+// idle opens NO window at all, so with the contact open and everything stopped,
+// the only thing that can ever start a load is the contact closing again.
 //
-//   - The timer's contact closing again. The window is simply dropped, because
-//     the timer is running and the normal gating takes over.
-//   - The mode switch moving. This RE-ARMS the window rather than closing it,
-//     and that is deliberate: moving the switch is the user restarting, so they
-//     get a fresh SYSTEM_ENABLE_HOLD_MS from the moment they touched it. It also
-//     works when the switch goes to another position and straight back, because
-//     it is driven off the movement bitmask rather than the mode value.
+// That distinction is the whole point of the gate. An earlier version of this
+// function opened the window on the enable dropping unconditionally, which meant
+// a fully idle machine with the contact open could still charge its capacitor
+// and pull the contacts in - the window was authorising a start rather than
+// keeping one alive, so a user who disconnected the enable, then discharged the
+// capacitor, got a compressor they had no enable for.
+//
+//   - The timer's contact closing: the window is dropped and normal gating takes
+//     over.
+//   - The contact opening with a load live: the window opens, to keep that load
+//     running for SYSTEM_ENABLE_HOLD_MS so the run can be picked back up without
+//     a full stop, capacitor discharge and re-charge.
+//   - The mode switch moving while a window is open: RE-ARMS it, giving a fresh
+//     SYSTEM_ENABLE_HOLD_MS from the moment the user touched it. Driven off the
+//     movement bitmask, so "nudge it off and back" counts even though the mode
+//     ends up unchanged. This only applies to an ALREADY open window, so moving
+//     the switch with the enable genuinely off still starts nothing.
 //
 // This only ever gates DEMAND. It cannot switch an output on by itself, and it
 // cannot delay the compressor's own protections - the capacitor interlock and the
@@ -1223,16 +1315,27 @@ void updateSystemEnable() {
   bool enabled = systemEnableDebounce.stable;
 
   if (enabled) {
-    systemEnableLostAt = 0; // timer running: no window needed
-  } else if (systemEnableState && systemEnableLostAt == 0) {
-    // First loop after the timer's contact opened. Open the window once.
-    systemEnableLostAt = millis();
-    DBG_PRINTF("[ENABLE] timer contact opened, holding outputs for %lums\n",
-               (unsigned long)SYSTEM_ENABLE_HOLD_MS);
-  } else if (systemEnableLostAt != 0 && switchMovedThisLoop) {
-    // The user is touching the switch during the window, so re-arm it.
-    systemEnableLostAt = millis();
-    DBG_PRINTLN("[ENABLE] switch moved during hold, restart window re-armed");
+    systemEnableWindowOpen = false; // timer running: no window needed
+  } else if (systemEnableState) {
+    // The enable just dropped. This branch only runs on the falling edge,
+    // because systemEnableState is not updated until the bottom of the function.
+    if (anyLoadActive()) {
+      systemEnableWindowOpen = true;
+      systemEnableWindowStart = millis();
+      DBG_PRINTF("[ENABLE] timer contact opened mid-run, sustaining for %lums\n",
+                 (unsigned long)SYSTEM_ENABLE_HOLD_MS);
+    } else {
+      DBG_PRINTLN("[ENABLE] timer contact opened with every load already idle - "
+                  "no restart window; nothing can start until it closes again");
+    }
+  }
+
+  if (!enabled && switchMovedThisLoop && systemEnableHoldRemaining() > 0) {
+    // The user is touching the switch inside a window they already earned, so
+    // re-arm it. Deliberately requires an open window, so this cannot become a
+    // way to start loads with the enable disconnected.
+    systemEnableWindowStart = millis();
+    DBG_PRINTLN("[ENABLE] switch moved during the restart window, re-armed");
   }
 
   systemEnableState = enabled;
@@ -1535,7 +1638,9 @@ void registerStatusRoutes() {
   server.on("/test/compressor", handleTestCompressor);
   server.on("/set/thresholds", handleSetThresholds);
   server.on("/set/current", handleSetCurrentLimit);
+  server.on("/set/fanfloor", handleSetFanFloor);
   server.on("/set/buzzer", handleSetBuzzer);
+  server.on("/cal/reset", handleCalReset);
   server.onNotFound(handleNotFound);
   server.begin();
 }
@@ -1728,8 +1833,12 @@ const char* capSeqName() {
 
 // Live JSON status for the web UI to poll (used by html.h page via fetch()).
 void handleStatusJson() {
-  int capAdcValue     = readCapacitorADC();
-  int currentAdcValue = read12VCurrentADC();
+  int capAdcValue = readCapacitorADC();
+  // currentAdcValue is deliberately NOT re-sampled here. It is the shared
+  // per-loop sample set by sampleCurrentAdc(), so the count on the page is the
+  // exact value the stall cut and fan check compared against. Taking a second
+  // sample in the HTTP handler would report a different number from the one
+  // that actually tripped, and would add 8 ADC reads to the request path.
   String json = "{";
   json += "\"mode\":\"" + String(modeName()) + "\",";
   // The switch position vs the mode in effect. They differ only while the
@@ -1766,10 +1875,14 @@ void handleStatusJson() {
         ? (COMPRESSOR_OFF_DELAY_MS - (millis() - compressorStopRequestedAt)) : 0) + ",";
   json += "\"currentAdc\":" + String(currentAdcValue) + ",";
   json += "\"currentVolts\":" + String(currentAdcToVolts(currentAdcValue), 2) + ",";
+  json += "\"currentAdcMin\":" + String(calCurrentAdcSeen ? calCurrentAdcMin : 0) + ",";
+  json += "\"currentAdcMax\":" + String(calCurrentAdcSeen ? calCurrentAdcMax : 0) + ",";
   json += "\"pumpStallLimit\":" + String(PUMP_STALL_ADC_MAX) + ",";
   json += "\"pumpStallLimitVolts\":" + String(currentAdcToVolts(PUMP_STALL_ADC_MAX), 2) + ",";
+  json += "\"pumpStallDisabled\":" + String(PUMP_STALL_ADC_MAX <= 0 ? "true" : "false") + ",";
   json += "\"fanRunMin\":" + String(FAN_RUN_ADC_MIN) + ",";
   json += "\"fanRunMinVolts\":" + String(currentAdcToVolts(FAN_RUN_ADC_MIN), 2) + ",";
+  json += "\"fanFloorDisabled\":" + String(FAN_RUN_ADC_MIN <= 0 ? "true" : "false") + ",";
   json += "\"pumpStalled\":" + String(pumpStalled ? "true" : "false") + ",";
   // Guarded rather than trusting the subtraction: update12VEnable() runs earlier
   // in this same loop and clears pumpStalled the moment the hold elapses, so
@@ -1880,19 +1993,61 @@ void handleSetThresholds() {
 
 // 12V rail pump-stall ceiling, accepted in volts. Converted here so the
 // authoritative value the pump logic uses stays in raw ADC counts.
+// 0 is accepted and means "disable the stall cut". That is the calibration
+// escape hatch: with the sense amplifier's gain unknown, a guessed ceiling
+// either trips constantly or never trips, and a pump cut every few seconds
+// cannot be measured at all.
+// 0 is deliberately NOT written to flash. This check cuts a load, so a power
+// cycle must always bring it back armed - the stored value stays at the last
+// real threshold and simply goes unused while the in-memory value is 0.
 void handleSetCurrentLimit() {
   if (!server.hasArg("volts")) {
     server.send(400, "text/plain", "need volts");
     return;
   }
   int newLimit = currentVoltsToAdc(server.arg("volts").toFloat());
-  if (newLimit < 1) newLimit = 1; // a ceiling of 0 would trip on any reading
-  // The prefs key stays "adcmax" on purpose: it is the same number as before,
-  // only the thing it means has changed, so existing calibration carries over.
+  if (newLimit < 0) newLimit = 0;
+  if (newLimit > ADC_FULL_SCALE) newLimit = ADC_FULL_SCALE;
+
   PUMP_STALL_ADC_MAX = newLimit;
+  if (newLimit == 0) {
+    DBG_PRINTLN("[SETTINGS] pump stall ceiling set to 0, DISABLED for this session; not saved, a reboot re-arms it");
+  } else {
+    // The prefs key stays "adcmax" on purpose: it is the same number as before,
+    // only the thing it means has changed, so existing calibration carries over.
+    prefs.begin("chiller", false);
+    prefs.putInt("adcmax", PUMP_STALL_ADC_MAX);
+    prefs.end();
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// 12V rail fan running-current floor, accepted in volts. 0 = disabled, and it
+// DOES persist: the fan check only raises a fault, it never cuts a load, and 0
+// is its shipped default because the amplifier's offset has not been measured.
+void handleSetFanFloor() {
+  if (!server.hasArg("volts")) {
+    server.send(400, "text/plain", "need volts");
+    return;
+  }
+  int newFloor = currentVoltsToAdc(server.arg("volts").toFloat());
+  if (newFloor < 0) newFloor = 0;
+  if (newFloor > ADC_FULL_SCALE) newFloor = ADC_FULL_SCALE;
+
+  FAN_RUN_ADC_MIN = newFloor;
   prefs.begin("chiller", false);
-  prefs.putInt("adcmax", PUMP_STALL_ADC_MAX);
+  prefs.putInt("fanmin", FAN_RUN_ADC_MIN);
   prefs.end();
+  if (newFloor == 0) {
+    DBG_PRINTLN("[SETTINGS] fan running-current floor set to 0, check disabled");
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// Clear the 12V peak hold so the next measurement starts from a clean capture.
+void handleCalReset() {
+  resetCurrentAdcCapture();
+  DBG_PRINTLN("[CAL] 12V peak hold cleared");
   server.send(200, "text/plain", "ok");
 }
 
@@ -1925,6 +2080,7 @@ void loadSettings() {
   cfgSsid = prefs.getString("ssid", MYSSIDIOT);
   cfgPass = prefs.getString("pass", MYPSKIOT);
   PUMP_STALL_ADC_MAX = prefs.getInt("adcmax", PUMP_STALL_ADC_MAX);
+  FAN_RUN_ADC_MIN    = prefs.getInt("fanmin", FAN_RUN_ADC_MIN);
   CAP_DISCHARGED_ADC_MAX  = prefs.getInt("capdis", CAP_DISCHARGED_ADC_MAX);
   CAP_CHARGED_ADC_MIN    = prefs.getInt("capchg", CAP_CHARGED_ADC_MIN);
   buzzerFrequency        = prefs.getInt("buzzerhz", buzzerFrequency);
@@ -1939,6 +2095,19 @@ void loadSettings() {
   }
   if (buzzerFrequency < BUZZER_FREQ_MIN || buzzerFrequency > BUZZER_FREQ_MAX) {
     buzzerFrequency = 2000;
+  }
+
+  // Backstop for the "0 disables the stall cut" rule. handleSetCurrentLimit()
+  // never writes 0, so this should be unreachable, but a hand-edited or
+  // truncated flash value must not be able to leave the pump unprotected.
+  if (PUMP_STALL_ADC_MAX <= 0) {
+    DBG_PRINTLN("[SETTINGS] stored pump stall ceiling was 0 or negative, re-arming it to the default");
+    PUMP_STALL_ADC_MAX = 500;
+  }
+  if (PUMP_STALL_ADC_MAX > ADC_FULL_SCALE) PUMP_STALL_ADC_MAX = ADC_FULL_SCALE;
+  if (FAN_RUN_ADC_MIN < 0 || FAN_RUN_ADC_MIN > ADC_FULL_SCALE) {
+    DBG_PRINTLN("[SETTINGS] stored fan floor out of range, reverting to disabled");
+    FAN_RUN_ADC_MIN = 0;
   }
 }
 

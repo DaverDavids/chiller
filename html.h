@@ -82,15 +82,30 @@ const char PAGE_STATUS[] PROGMEM = R"====(
 <table id="statusTable"></table>
 
 <h3>Calibration</h3>
+
+<div id="calWarn"></div>
+
+<div class="card">
+  <div style="font-weight:bold;margin-bottom:4px">Live readings</div>
+  <div style="color:#888;font-size:11px;margin-bottom:6px">
+    The volts figures come from a placeholder divider, so treat the
+    <b>raw counts</b> as the number to write down. Record the counts in each state
+    below, then fit CURRENT_SENSE_DIVIDER to them in the sketch.
+  </div>
+  <div id="calLive"></div>
+</div>
+
 <div class="card">
   <div style="font-weight:bold;margin-bottom:4px">Capacitor sense (GPIO0)</div>
   <div>
     Discharged at or below
     <input type="number" id="vdis" step="0.01" min="0" max="3.3"> V
+    <span class="gpio" id="acdis"></span>
   </div>
   <div style="margin-top:6px">
     Charged at or above
     <input type="number" id="vchg" step="0.01" min="0" max="3.3"> V
+    <span class="gpio" id="acchg"></span>
   </div>
   <div style="margin-top:8px">
     <button onclick="saveThresholds()">Save capacitor</button>
@@ -101,24 +116,44 @@ const char PAGE_STATUS[] PROGMEM = R"====(
     pair closer than the minimum, because the contacts must never be able to
     close on a charged capacitor.
   </div>
+</div>
 
-  <div style="font-weight:bold;margin:16px 0 4px">12V current sense (GPIO2)</div>
-  <div style="color:#888;font-size:11px;margin-bottom:4px">
+<div class="card">
+  <div style="font-weight:bold;margin:0 0 4px">12V current sense (GPIO2)</div>
+  <div style="color:#888;font-size:11px;margin-bottom:6px">
     Rail monitor: fan + pump. Ceiling = pump stall. Floor = fan turning.
+    Set either to <b>0</b> to disable that check while you measure - a guessed
+    threshold otherwise cuts the pump every few seconds and ruins the reading.
+    The pump ceiling is <b>never saved</b> at 0, so a reboot always re-arms it.
   </div>
   <div>
     Pump stall ceiling
     <input type="number" id="vcur" step="0.01" min="0" max="3.3"> V
+    <span class="gpio" id="acccur"></span>
+  </div>
+  <div style="margin-top:6px">
+    Fan running floor
+    <input type="number" id="vfan" step="0.01" min="0" max="3.3"> V
+    <span class="gpio" id="accfan"></span>
   </div>
   <div style="margin-top:8px">
-    <button onclick="saveCurrentLimit()">Save current</button>
+    <button onclick="saveCurrentLimit()">Save ceiling</button>
+    <button onclick="saveFanFloor()">Save floor</button>
+    <button onclick="disableCurrentChecks()">Disable both to calibrate</button>
     <span id="cmsg"></span>
   </div>
-  <div style="color:#888;font-size:11px;margin-top:8px">
-    The 12V sense scaling is UNCALIBRATED - the divider is a placeholder, so
-    the volts figure is currently just the pin voltage. Measure against a known
-    load and set CURRENT_SENSE_DIVIDER in the sketch. Readings in volts are
-    indicative only; the C3's ADC is nonlinear near the rails.
+
+  <div style="margin-top:12px;border-top:1px solid #333;padding-top:8px">
+    <div style="font-weight:bold;margin-bottom:4px">Peak hold since reset</div>
+    <div id="calPeak"></div>
+    <div style="margin-top:6px">
+      <button onclick="resetCapture()">Reset capture</button>
+    </div>
+    <div style="color:#888;font-size:11px;margin-top:6px">
+      A stall is a fast transient - the averaged sample may only cross the
+      threshold for a few loops. This holds the highest and lowest counts seen
+      since the last reset, so a pump start spike can be read back afterwards.
+    </div>
   </div>
 </div>
 
@@ -298,6 +333,56 @@ function saveCurrentLimit() {
     });
 }
 
+function saveFanFloor() {
+  var v = document.getElementById('vfan').value;
+  editing.f = true;
+  fetch('/set/fanfloor?volts=' + encodeURIComponent(v))
+    .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, msg: t }; }); })
+    .then(function (res) {
+      document.getElementById('cmsg').innerHTML =
+        res.ok ? '<span class="ok">saved</span>' : '<span class="bad">' + res.msg + '</span>';
+      if (res.ok) { editing.f = false; refresh(); }
+    })
+    .catch(function () {
+      document.getElementById('cmsg').innerHTML = '<span class="bad">request failed</span>';
+    });
+}
+
+// One-click version of setting both thresholds to 0, which is the state you want
+// while measuring the sense line. Post sequentially so a failure on the first
+// cannot leave the two halves disagreeing silently.
+function disableCurrentChecks() {
+  editing.c = true; editing.f = true;
+  fetch('/set/current?volts=0')
+    .then(function (r) { return r.ok ? r.text() : Promise.reject('ceiling rejected'); })
+    .then(function () { return fetch('/set/fanfloor?volts=0'); })
+    .then(function (r) {
+      document.getElementById('cmsg').innerHTML =
+        r.ok ? '<span class="ok">both checks disabled</span>'
+             : '<span class="bad">ceiling disabled, floor failed</span>';
+      editing.c = false; editing.f = false;
+      refresh();
+    })
+    .catch(function (e) {
+      document.getElementById('cmsg').innerHTML =
+        '<span class="bad">failed: ' + e + '</span>';
+      editing.c = false; editing.f = false;
+      refresh();
+    });
+}
+
+function resetCapture() {
+  fetch('/cal/reset')
+    .then(function (r) {
+      document.getElementById('cmsg').innerHTML =
+        r.ok ? '<span class="ok">capture reset</span>' : '<span class="bad">failed</span>';
+      refresh();
+    })
+    .catch(function () {
+      document.getElementById('cmsg').innerHTML = '<span class="bad">request failed</span>';
+    });
+}
+
 function saveBuzzer() {
   var hz = document.getElementById('bhz').value;
   editing.hz = true;
@@ -313,13 +398,10 @@ function saveBuzzer() {
     });
 }
 
-['vdis', 'vchg', 'vcur'].forEach(function (id) {
-  document.getElementById(id).addEventListener('focus', function () {
-    editing[id === 'vcur' ? 'c' : 'v'] = true;
-  });
-  document.getElementById(id).addEventListener('blur', function () {
-    editing[id === 'vcur' ? 'c' : 'v'] = false;
-  });
+['vdis', 'vchg', 'vcur', 'vfan'].forEach(function (id) {
+  var key = { vdis: 'v', vchg: 'v', vcur: 'c', vfan: 'f' }[id];
+  document.getElementById(id).addEventListener('focus', function () { editing[key] = true; });
+  document.getElementById(id).addEventListener('blur', function () { editing[key] = false; });
 });
 document.getElementById('bhz').addEventListener('focus', function () { editing.hz = true; });
 document.getElementById('bhz').addEventListener('blur', function () { editing.hz = false; });
@@ -332,7 +414,56 @@ function refresh() {
     setInput('vdis', d.capDischargedVolts, 'v');
     setInput('vchg', d.capChargedVolts, 'v');
     setInput('vcur', d.pumpStallLimitVolts, 'c');
+    setInput('vfan', d.fanRunMinVolts, 'f');
     setInput('bhz', d.buzzerHz, 'hz');
+
+    // ---- calibration panel ----
+    // Raw counts beside every input, so the numbers written down during a
+    // calibration session are the ones the firmware actually compares, not
+    // volts that have been through a placeholder divider.
+    document.getElementById('acdis').textContent =
+      'now ' + d.capAdc + '  dis<=' + d.capDischargedMax + '  chg>=' + d.capChargedMin;
+    document.getElementById('acchg').textContent =
+      'now ' + d.capAdc + '  dis<=' + d.capDischargedMax + '  chg>=' + d.capChargedMin;
+    document.getElementById('acccur').textContent = d.pumpStallDisabled
+      ? 'adc ' + d.pumpStallLimit + ' - DISABLED'
+      : 'adc ' + d.pumpStallLimit;
+    document.getElementById('accfan').textContent = d.fanFloorDisabled
+      ? 'adc ' + d.fanRunMin + ' - DISABLED'
+      : 'adc ' + d.fanRunMin;
+
+    let live = row('12V sense now', d.currentVolts + ' V <span class="gpio">adc ' +
+                   d.currentAdc + '</span>');
+    live += row('Cap sense now', d.capVolts + ' V <span class="gpio">adc ' +
+                d.capAdc + '</span>');
+    if (d.pumpStalled) {
+      live += row('Pump', '<span class="bad">STALLED</span> &middot; retry in ' +
+                  fmtMs(d.pumpStallRetryRemainingMs), '');
+    }
+    document.getElementById('calLive').innerHTML = live;
+
+    document.getElementById('calPeak').innerHTML =
+      row('Low seen', '<span class="gpio">adc ' + d.currentAdcMin + '</span>') +
+      row('High seen', '<span class="gpio">adc ' + d.currentAdcMax + '</span>') +
+      row('Spread', '<span class="gpio">' +
+        (d.currentAdcMax - d.currentAdcMin) + ' counts</span>');
+
+    // Loud, and in the same place as the inputs, because 0 means "this
+    // protection is off right now" and that is not something to discover later.
+    let warn = '';
+    if (d.pumpStallDisabled) {
+      warn += '<div class="card" style="border:2px solid #b00">' +
+        '<span class="bad">PUMP STALL CUT IS DISABLED</span> ' +
+        '<span style="font-size:11px">- the pump can be jammed and will not be ' +
+        'cut. Rebooting re-arms it automatically.</span></div>';
+    }
+    if (d.fanFloorDisabled) {
+      warn += '<div class="card" style="border:1px solid #a80">' +
+        '<span class="bad">FAN RUNNING CHECK IS DISABLED</span> ' +
+        '<span style="font-size:11px">- a seized fan will not be reported. ' +
+        'This one stays disabled until a floor is measured.</span></div>';
+    }
+    document.getElementById('calWarn').innerHTML = warn;
     html += row('Mode', modeSpan(d.mode));
     // System enable is the master gate, so it sits directly under the mode: it
     // is the single answer to "is anything allowed to run right now".

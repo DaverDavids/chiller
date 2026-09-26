@@ -70,7 +70,7 @@ contact open:
 - The manual `/test/compressor` override cannot bypass it either - it sets the
   demand flag, and the demand flag is gated.
 
-### The 2-minute restart window
+### The 2-minute restart window — sustains, never starts
 
 If the timer's contact **opens mid-run**, the outputs are deliberately kept running
 for `SYSTEM_ENABLE_HOLD_MS` (**2 minutes**). This is a restart window, not a
@@ -78,20 +78,50 @@ minimum run time: the user has two minutes to wind the timer back up, or to move
 the mode switch, and pick the run back up **without the compressor going through a
 full stop, capacitor discharge and re-charge**.
 
-- Moving the mode switch **re-arms** the window - it gets a fresh 2 minutes from
-  the moment it is touched. This works when the switch goes to a different
-  position and straight back again, which is the intended restart gesture. It is
-  driven off a bitmask over the accepted switch readings rather than the mode
+**The window can only sustain a run that was already happening. It can never
+authorise a new start.**
+
+This distinction is the whole safety point of the gate, and it was a real bug in
+an earlier version. The window originally opened on the contact dropping
+*unconditionally*, which meant a fully idle machine with the contact open could
+still charge its capacitor and pull the contacts in — the window was permitting a
+start rather than keeping one alive. Concretely: enable disconnected, then
+discharge the capacitor, and the compressor came on with no enable at all. Now:
+
+- The contact opens **with a load live** → window opens, to keep it running.
+- The contact opens with **every load already idle** → **no window at all**, and
+  the log says so. With the contact open and nothing running, the only thing that
+  can ever start a load is the contact closing again.
+- Moving the mode switch **re-arms** an *already open* window, giving a fresh 2
+  minutes from the moment it is touched. This works when the switch goes to a
+  different position and straight back, which is the intended restart gesture. It
+  is driven off a bitmask over the accepted switch readings rather than the mode
   value, precisely so "nudge it off and back" is detected even though the mode
-  ends up unchanged.
-- The status LEDs keep animating throughout, so a machine sitting in the window
-  looks alive rather than switched off.
+  ends up unchanged. Because it requires an open window, it cannot become a way to
+  start loads with the enable disconnected.
 - The window is dropped as soon as the timer's contact closes again.
+
+Whether a load is live is read from the **output pins**, not the demand flags —
+the demand flags are what the window is about to influence, so asking them would
+be circular.
 
 It gates **demand only**, and cannot postpone the compressor's own protections:
 the capacitor interlock and the `PRECHARGE_TIMEOUT_MS` fault both act every loop
 regardless of demand. It also cannot delay a pump stall cut, which is applied on
 the first overcurrent sample.
+
+### Confirming the polarity at boot
+
+`setup()` prints one line immediately, before anything can act on the input:
+
+```
+[ENABLE] GPIO4 raw=HIGH -> disabled (active LOW: contact closed = enabled)
+```
+
+If the enable is **not** connected and this reads `ENABLED`, the pin is being
+pulled low by something on the board, or the active level is the wrong way round.
+It is worth catching at boot rather than inferring it later from a load that came
+on unexpectedly.
 
 ### Feedback sounds
 
@@ -244,12 +274,62 @@ having to trust it.
 | --- | --- | --- | --- |
 | Capacitor discharged at/below | volts | `capDischargedVolts` | `capdis` |
 | Capacitor charged at/above | volts | `capChargedVolts` | `capchg` |
-| 12V pump stall ceiling | volts | `pumpStallLimitVolts` | `adcmax` |
+| 12V pump stall ceiling | volts, `0` disables | `pumpStallLimitVolts` | `adcmax` |
+| 12V fan running floor | volts, `0` disables | `fanRunMinVolts` | `fanmin` |
 | Buzzer frequency | Hz | `buzzerHz` | `buzzerhz` |
 
 Endpoints: `/set/thresholds?vdischarged=&vcharged=`, `/set/current?volts=`,
-`/set/buzzer?hz=`. Volts are converted once on the device, so the stored and
-authoritative values remain raw ADC counts.
+`/set/fanfloor?volts=`, `/cal/reset`, `/set/buzzer?hz=`. Volts are converted once
+on the device, so the stored and authoritative values remain raw ADC counts.
+
+Every input in the panel also shows the **live raw count** beside it, not just in
+the status table, and the 12V sense is sampled once per loop so the count on the
+page is the exact sample the protection compared against.
+
+### Disabling a check: set the threshold to 0
+
+Both 12V thresholds accept `0` as "this check is off". This is the calibration
+escape hatch, and it is needed: with the sense amplifier's gain unknown, a
+guessed threshold either trips constantly or never trips, and a pump that gets
+cut every few seconds is impossible to measure.
+
+The two are deliberately **not** treated the same way on reboot:
+
+| Threshold | What it does | `0` persisted? | After a power cycle |
+| --- | --- | --- | --- |
+| `PUMP_STALL_ADC_MAX` | cuts the pump | **no** | always back to the last real threshold |
+| `FAN_RUN_ADC_MIN` | raises a fault only | yes | stays disabled until a floor is set |
+
+`handleSetCurrentLimit()` never writes `0` to flash, so a forgotten disable
+cannot leave the pump unprotected - the stored value simply goes unused while the
+in-memory value is `0`. `loadSettings()` re-arms it as a backstop against a
+hand-edited value. The fan floor only reports and never cuts a load, and `0` is
+its shipped default, so it persists normally.
+
+While either is disabled the Calibration panel shows a red banner naming which
+protection is off, and `/status` carries `pumpStallDisabled` / `fanFloorDisabled`.
+
+### Peak hold
+
+`/cal/reset` clears a min/max capture of the 12V sense, shown under **Peak hold
+since reset**. A pump stall is a fast transient: the averaged sample may only
+cross the threshold for a handful of loops, so the count that actually tripped it
+would otherwise be gone before anyone opened the page. The capture holds the
+highest and lowest counts since the last reset, which is what makes the start
+spike measurable after the fact.
+
+### Suggested calibration order
+
+1. Hit **Disable both to calibrate**, so nothing cuts the pump mid-measurement.
+2. **Reset capture.** Record the 12V count with everything off - that is the
+   amplifier's offset.
+3. Start the fan only, reset, record the count - that is the fan's running
+   current, and is where `fanmin` goes (leave headroom below it).
+4. Start the pump, reset, record the peak - that is what `adcmax` must sit
+   above, with margin.
+5. Fit `CURRENT_SENSE_DIVIDER` from the readings against a meter, rebuild, and set
+   the two thresholds in volts. Re-enable both and confirm the pump still cuts on
+   a deliberate stall.
 
 Each analog input has its own scaling constant, because the two sensing paths are
 not the same circuit:
@@ -273,8 +353,8 @@ satisfy the "discharged" test and the contacts could close on a charged
 capacitor, defeating the interlock entirely. `loadSettings()` re-asserts the band
 so a corrupted or hand-edited flash value cannot collapse it either.
 
-The pump stall ceiling has no such guard because a ceiling of 0 counts would be
-*less* conservative, not more, so it is merely floored at 1 count.
+The pump stall ceiling has no hysteresis guard because it is a single limit, and
+`0` now means "disabled" rather than "trip on everything" - see above.
 
 ### Why the charge output is parked LOW while waiting to discharge
 
@@ -602,8 +682,15 @@ and precharge timeouts.
   ratio so the volts readout means anything. Measure the GPIO2 pin voltage at a
   known 12V load current, set the constant, then set the ceiling in volts from
   the UI. Measure the *combined* fan+pump rail, not the pump alone.
-- `FAN_RUN_ADC_MIN` is 0 and therefore inert. It needs a real fan-only running
-  current before it can detect a seized fan at all.
+- `FAN_RUN_ADC_MIN` is 0 and therefore inert, and it is now settable from the UI
+  (`/set/fanfloor`) instead of being a compile-time constant. It needs a real
+  fan-only running current before it can detect a seized fan at all. Unlike the
+  pump ceiling, `0` persists here on purpose - the check only reports, and 0 is
+  its shipped default.
+- The 12V sense panel now has everything needed to calibrate: live raw counts
+  beside both thresholds, a min/max peak hold, a one-click "disable both to
+  calibrate", and a capture reset. See **Suggested calibration order** above.
+  `CURRENT_SENSE_DIVIDER` is still the one thing that has to be compiled in.
 - The pump stall cut is currently **not** a latched fault: a persistent
   overcurrent will keep cutting and retrying every 5 seconds forever. Decide
   whether a sustained stall should latch and need a manual reset, as
