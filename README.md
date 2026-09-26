@@ -17,7 +17,7 @@ status and manual function testing.
 | 4    | Timer on/off input                    | n/a |
 | 5    | Fan output                            | LOW |
 | 6    | Buzzer output                         | LOW |
-| 7    | 12V enable output (powers the pump)    | LOW |
+| 7    | 12V enable output (PUMP ONLY)          | LOW |
 | 8    | Compressor output                     | LOW |
 | 9    | 5V enable output                      | HIGH |
 | 10   | Switch position 4 - pump + chiller, active low | n/a |
@@ -49,14 +49,15 @@ discharge:
 | Phase          | Charge out | Compressor | Exits when |
 |----------------|-----------|------------|------------|
 | `WAIT_DISCHARGE` | LOW     | LOW        | cap &le; `CAP_DISCHARGED_ADC_MAX` **and** compressor requested |
-| `CHARGING`       | HIGH    | LOW        | cap &ge; `CAP_CHARGED_ADC_MIN` **and** 12V current sense clear |
-| `RUNNING`        | HIGH    | HIGH       | demand removed or 12V current sense shows overcurrent |
+| `CHARGING`       | HIGH    | LOW        | cap &ge; `CAP_CHARGED_ADC_MIN` |
+| `RUNNING`        | HIGH    | HIGH       | demand removed |
 
-Two independent conditions must hold to close the contacts: the capacitor has
-to be proven charged, and the 12V current sense (GPIO2) has to be at or below
-`COMPRESSOR_SAFE_ADC_MAX`. Charging that does not reach
-`CAP_CHARGED_ADC_MIN` within `PRECHARGE_TIMEOUT_MS` latches a fault instead of
-closing on an unproven capacitor. A latched fault forces both the charge and
+Exactly one condition closes the contacts: the capacitor has to be proven
+charged. Charging that does not reach `CAP_CHARGED_ADC_MIN` within
+`PRECHARGE_TIMEOUT_MS` latches a fault instead of closing on an unproven
+capacitor. The 12V current sense plays **no** part in this interlock - it is a
+rail monitor belonging to the pump and the fan, see
+[12V rail current sense](#12v-rail-current-sense) below. A latched fault forces both the charge and
 compressor outputs off and only clears after the chiller demand has been
 removed for `FAULT_RESET_HOLD_MS`, so bouncing the switch cannot immediately
 re-charge a bad capacitor.
@@ -102,13 +103,18 @@ real cold power-cycle (brownout/reset is also a strapping sample point):
    onboard status LED sits on GPIO8 (active low), so the compressor output
    will mirror onto that LED.
 
-### 12V enable during capacitor charging
+### The 12V enable is the pump, not the rail
 
-`update12VEnable()` keeps the 12V enable pin (GPIO7) on while the compressor is
-running. It does **not** stay on during the `CHARGING` phase, because the
-capacitor is charged straight from GPIO1 through a diode and does not need the
-12V rail. If that ever changes, the call site in `loop()` is where to hold the
-rail through charging.
+`PIN_12V_EN` (GPIO7) gates **the pump only**. The compressor is not fed through
+it - the compressor runs off its own interlocked contacts on `PIN_COMPRESSOR`,
+and the capacitor is charged straight from GPIO1 through a diode.
+
+An earlier version of `update12VEnable()` ORed `compressorIsRunning` into the
+enable so "the rail is never cut out from under a closed contact". That was
+wrong twice over: it kept the pump powered whenever the chiller ran, and it
+meant there was **no way to cut an overcurrenting pump without also killing a
+running chiller**. The OR is gone, which is what makes the pump stall cut below
+possible at all.
 
 ## Mode switch behavior
 
@@ -154,7 +160,7 @@ having to trust it.
 | --- | --- | --- | --- |
 | Capacitor discharged at/below | volts | `capDischargedVolts` | `capdis` |
 | Capacitor charged at/above | volts | `capChargedVolts` | `capchg` |
-| 12V current overcurrent limit | volts | `currentLimitVolts` | `adcmax` |
+| 12V pump stall ceiling | volts | `pumpStallLimitVolts` | `adcmax` |
 | Buzzer frequency | Hz | `buzzerHz` | `buzzerhz` |
 
 Endpoints: `/set/thresholds?vdischarged=&vcharged=`, `/set/current?volts=`,
@@ -183,8 +189,8 @@ satisfy the "discharged" test and the contacts could close on a charged
 capacitor, defeating the interlock entirely. `loadSettings()` re-asserts the band
 so a corrupted or hand-edited flash value cannot collapse it either.
 
-The current limit has no such guard because a limit of 0 counts would be *more*
-conservative, not less, so it is merely floored at 1 count.
+The pump stall ceiling has no such guard because a ceiling of 0 counts would be
+*less* conservative, not more, so it is merely floored at 1 count.
 
 ### Why the charge output is parked LOW while waiting to discharge
 
@@ -253,19 +259,68 @@ With the off-delay, the sequence runs like this:
 If demand does *not* return, the contacts open when the off-delay expires and the
 next start re-arms from a discharged capacitor as normal.
 
-Overcurrent is tested **before** both holds, so a 12V current-sense trip still
-opens the contacts on the very next loop with no delay. A latched fault also
-overrides everything and forces both outputs off. Neither hold can delay a
-safety trip.
+There is no safety trip that bypasses these holds any more, because the only
+safety input the compressor has is its own capacitor interlock. A latched
+`compressorFault` still overrides everything and forces both outputs off.
 
 ## Pump anti-short-cycle delay
 
 The 12V enable output is not switched off the instant pump demand disappears.
-`update12VEnable()` holds it on for `PUMP_OFF_DELAY_MS` (placeholder: 5
-seconds) after demand drops, so flipping through switch positions doesn't stop
-and immediately restart the pump. It also stays on whenever the compressor is
-running, so the 12V rail is never cut out from under a closed contact. Adjust
-`PUMP_OFF_DELAY_MS` to taste.
+`update12VEnable()` holds it on for `PUMP_OFF_DELAY_MS` (1 second) after demand
+drops, so flipping through switch positions doesn't stop and immediately restart
+the pump. Adjust `PUMP_OFF_DELAY_MS` to taste.
+
+This hold is cancelled, not merely paused, while a pump stall is cutting the
+pump - see below. Honouring it there would hold an overcurrenting pump powered
+for another second after the fault, which is exactly the delay the stall cut
+exists to avoid.
+
+## 12V rail current sense
+
+`PIN_ADC_12V` (GPIO2) is a **rail monitor, not a compressor sensor**. It reads
+everything on the 12V rail, which in practice means the fan (whenever the
+compressor is running) plus the pump (whenever the 12V enable is on). That is
+why it is read against a floor and a ceiling rather than as one limit, and why
+neither limit belongs to the compressor.
+
+| Limit | Value | Meaning |
+|-------|-------|---------|
+| `PUMP_STALL_ADC_MAX` | 500 (placeholder) | Ceiling. Above it the pump is stalled or jammed. |
+| `FAN_RUN_ADC_MIN` | 0 | Floor, checked only while the compressor runs. `0` = disabled. |
+
+### Pump stall: cut instantly, retry after 5 seconds
+
+An overcurrent **cuts the 12V enable on that very loop** - no delay, no
+anti-short-cycle hold, nothing in the way. The pump then stays cut until the
+rail has been clean for `PUMP_STALL_RETRY_MS` (5 seconds).
+
+The hold is measured from the **last** overcurrent sample rather than the first,
+and the clock is restarted on every overcurrent sample. So it can only elapse
+once the rail has been clean for the entire window, and a pump that trips the
+instant it is re-energised never gets a second attempt.
+
+The hold is deliberately **not** reset by pump demand dropping. A stall is a real
+fault, so putting the switch to OFF and back again does not buy a free restart -
+it just burns wall-clock time while the pump stays cut.
+
+Because the enable pin is pump-only, **a pump stall leaves a running chiller
+completely unaffected**. That is the whole point of separating the two.
+
+### Fan floor: present but inert
+
+A seized fan on a running compressor will overheat it, so the floor is sampled
+every loop while the contacts are closed. But `FAN_RUN_ADC_MIN` is `0`, and no
+reading can fall below `0`, so **the check cannot fire yet** - the sense
+amplifier's offset and the fan's running current have not been measured, and
+guessing a floor would trip on noise.
+
+It is report-only even once calibrated: it sets `fanStalled` for the web UI and
+does **not** open the compressor contacts, because a spurious trip on an
+uncalibrated floor would stop a healthy chiller.
+
+Note the two limits overlap by design: while the compressor runs, the reading
+includes the fan's baseline, so the ceiling has to sit above that baseline or
+the pump would be cut for the fan's sake.
 
 ## Mode change delay
 
@@ -369,7 +424,7 @@ timer, and all 4 switch positions.
 **Settings** (both persisted to flash):
 
 - Capacitor thresholds, entered in volts, shown next to the raw ADC count.
-- 12V current-sense overcurrent limit, entered in volts, shown next to the raw
+- 12V pump stall ceiling, entered in volts, shown next to the raw
   ADC count. Marked *uncalibrated* until `CURRENT_SENSE_DIVIDER` is measured.
 - Buzzer test frequency in Hz.
 
@@ -417,7 +472,7 @@ and precharge timeouts.
   from `loop()`; nothing waits for `WL_CONNECTED` in a loop. The previous
   implementation blocked for up to `WIFI_CONNECT_TIMEOUT_MS` (10s) per attempt -
   and `loop()` is what runs the compressor interlock, so every retry would have
-  delayed a 12V overcurrent trip by up to 10s with the contacts held closed.
+  delayed the compressor interlock by up to 10s with the contacts held closed.
   There is no `delay()` and no `ESP.restart()` anywhere in the runtime path.
 - Saving new credentials in the portal no longer reboots the device. It stores them
   and immediately attempts a connection, so a running chiller is not interrupted
@@ -436,24 +491,27 @@ and precharge timeouts.
   need calibration against the real capacitor charge curve. Keep a wide gap
   between them - that gap is the hysteresis band, and a narrow one risks chatter
   around a threshold in the noise.
-- `COMPRESSOR_SAFE_ADC_MAX` placeholder (500) needs calibration against the
-  real 12V current-sense curve, **and** `CURRENT_SENSE_DIVIDER` needs a measured
+- `PUMP_STALL_ADC_MAX` placeholder (500) needs calibration against the real
+  12V current-sense curve, **and** `CURRENT_SENSE_DIVIDER` needs a measured
   ratio so the volts readout means anything. Measure the GPIO2 pin voltage at a
-  known 12V load current, set the constant, then set the overcurrent limit in
-  volts from the UI.
+  known 12V load current, set the constant, then set the ceiling in volts from
+  the UI. Measure the *combined* fan+pump rail, not the pump alone.
+- `FAN_RUN_ADC_MIN` is 0 and therefore inert. It needs a real fan-only running
+  current before it can detect a seized fan at all.
+- The pump stall cut is currently **not** a latched fault: a persistent
+  overcurrent will keep cutting and retrying every 5 seconds forever. Decide
+  whether a sustained stall should latch and need a manual reset, as
+  `compressorFault` does.
 - Verify the pulsed buzzer actually sounds on hardware - the `tone()`/LEDC path
   should be confirmed once on the real board.
-- **Overcurrent is not a latched fault.** A 12V current-sense trip just opens the
-  contacts; a *persistent* overcurrent will therefore keep retrying (slowly -
-  each attempt needs a fresh capacitor discharge). Decide whether a sustained
-  overcurrent should latch and require manual recovery.
 - `PRECHARGE_TIMEOUT_MS`, `COMPRESSOR_MIN_RUN_MS`, `COMPRESSOR_OFF_DELAY_MS` and
   `FAULT_RESET_HOLD_MS` are guesses.
 - **Verify the strapping pins on a cold boot** - especially GPIO2, which must
   latch HIGH. See the strapping section above.
-- `PIN_SWITCH_1` is unwired, so OFF is not a deliberate switch position - it is
-  only reachable via the "0-or-2+-active" fail-safe path. Confirm that is what
-  you want long-term, or assign a real pin.
+- `PIN_SWITCH_1` is unwired, so OFF has no input of its own. It is now selected
+  *implicitly* whenever none of positions 2/3/4 read active, so an unwired
+  position 1 works as a deliberate "off" position. Assign a real pin if you ever
+  want to distinguish "parked at 1" from a wiring fault.
 - Debounce is implemented per switch input at `SWITCH_DEBOUNCE_MS` (500 ms) -
   a raw reading must be stable that long before it is acted on. Tune to taste;
   too long feels laggy, too short defeats the purpose. The timer input is

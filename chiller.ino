@@ -8,7 +8,7 @@
   Pin map:
     GPIO0   - ADC: capacitor voltage sense (charge interlock)
     GPIO1   - Capacitor charge output (LOW at boot)
-    GPIO2   - ADC: 12V current sense (overcurrent gate)
+    GPIO2   - ADC: 12V rail current sense (pump stall ceiling / fan floor)
     GPIO3   - Switch position 3 input (CHILLER ONLY) [active low, pull-up]
     GPIO4   - Timer on/off input
     GPIO5   - Fan output
@@ -53,15 +53,34 @@
     entirely in updateCompressorInterlock(), which is the ONLY function that
     writes the charge output or the compressor output. There is no flag,
     endpoint, or state that reaches the compressor without passing through it.
-    A start additionally requires the 12V current sense (GPIO2) to be clear of
-    overcurrent, and charging must complete within PRECHARGE_TIMEOUT_MS or the
-    fault latches rather than closing the contacts anyway.
+    A start requires nothing but a proven discharged capacitor; charging must
+    complete within PRECHARGE_TIMEOUT_MS or the fault latches rather than
+    closing the contacts anyway. The 12V current sense (GPIO2) plays NO part in
+    this interlock - it is a rail monitor belonging to the pump and the fan, see
+    the section below.
 
   PUMP ANTI-SHORT-CYCLE:
     The 12V enable output (GPIO7) is NOT switched off the instant pump demand
     drops. It's held on for PUMP_OFF_DELAY_MS after demand goes away so that
     flipping through switch positions doesn't stop/restart the pump every time
     - see update12VEnable().
+
+  12V CURRENT SENSE (GPIO2) - A RAIL MONITOR, NOT A COMPRESSOR SENSOR:
+    It reads everything on the 12V rail, which is the fan plus the pump. It is
+    read against two limits, and neither of them belongs to the compressor:
+      - a CEILING (PUMP_STALL_ADC_MAX) for the pump. Above it the pump is
+        stalled or jammed, so the 12V enable is cut on that very loop and the
+        pump stays cut until the rail has been clean for PUMP_STALL_RETRY_MS.
+        That hold is latched across a mode change on purpose.
+      - a FLOOR (FAN_RUN_ADC_MIN) for the fan, checked only while the
+        compressor runs. Currently 0, which no reading can fall below, so the
+        check is inert until a real running current is measured. It reports
+        only; it never opens the compressor contacts, because an uncalibrated
+        floor would otherwise stop a healthy chiller.
+    The compressor is interlocked by its own capacitor, not by this sensor. The
+    contacts close on "capacitor proven charged" alone. GPIO7 is the PUMP enable
+    only - it is not the rail for the whole machine - so cutting the pump on a
+    stall leaves a running chiller completely unaffected.
 
   SAFETY NOTE: PIN_CAP_CHARGE and PIN_COMPRESSOR are written in exactly one
   place, updateCompressorInterlock(). Do not add any other digitalWrite() on
@@ -105,7 +124,7 @@ const unsigned long WIFI_RETRY_INTERVAL_MS  = 3000;
 // Connection is a non-blocking state machine rather than a blocking
 // wait-for-connected loop. A blocking attempt would stall loop() for up to
 // WIFI_CONNECT_TIMEOUT_MS, and loop() is what runs the compressor interlock -
-// so every retry would delay a 12V overcurrent trip by that much, with the
+// so every retry would delay the compressor interlock by that much, with the
 // contacts held closed. Never block here.
 enum WifiPhase {
   WIFI_PHASE_IDLE,       // not connected, no attempt in flight
@@ -128,7 +147,7 @@ bool wifiReconnectRequested = false;
 #define PIN_TIMER_IN   4   // timer on/off input
 #define PIN_FAN        5
 #define PIN_BUZZER     6
-#define PIN_12V_EN     7   // 12V enable - powers the pump
+#define PIN_12V_EN     7   // 12V enable - PUMP ONLY, not the whole rail
 #define PIN_COMPRESSOR 8
 #define PIN_5V_EN      9
 
@@ -205,9 +224,29 @@ int CAP_DISCHARGED_ADC_MAX = 500; // at/below this the capacitor counts as
                                   // discharged and a start may be armed
 int CAP_CHARGED_ADC_MIN   = 3000; // at/above this the capacitor counts as
                                   // charged and the contacts may close
-// 12V current sense (PIN_ADC_12V): the compressor is allowed ON only while the
-// reading is at or below this. Higher reading == more current == unsafe.
-int COMPRESSOR_SAFE_ADC_MAX = 500;      // placeholder, 0-4095 (12-bit ADC)
+// 12V current sense (PIN_ADC_12V).
+//
+// This is a RAIL monitor, not a compressor measurement - it has nothing to do
+// with the compressor's own capacitor interlock. It sees everything drawing from
+// the 12V rail, which in practice means the fan (whenever the compressor is
+// running) plus the pump (whenever the 12V enable is on). That is why it is
+// read against a FLOOR and a CEILING rather than as one limit:
+//
+//   PUMP_STALL_ADC_MAX  the ceiling. Above this the pump is drawing too much -
+//                       a stalled or jammed impeller. Cuts the pump instantly.
+//   FAN_RUN_ADC_MIN     the floor, checked only while the compressor is running.
+//                       Below this the fan is not turning - a seized fan on a
+//                       running compressor will cook it. ZERO, so the check is
+//                       inert for now: the sense amplifier's offset and the
+//                       fan's running current have not been measured yet, and
+//                       guessing a floor would trip on noise. Set it once a
+//                       real running-current figure is known.
+//
+// The two overlap on purpose: while the compressor runs the reading includes
+// the fan's baseline, so the ceiling has to sit above that baseline or the pump
+// would be cut for the fan's sake. Calibrate both against a meter.
+int PUMP_STALL_ADC_MAX = 500;           // placeholder, 0-4095 (12-bit ADC)
+int FAN_RUN_ADC_MIN    = 0;             // 0 = fan check disabled, see above
 const uint8_t ADC_SAMPLE_COUNT = 8;     // simple averaging, tune later
 
 // ==================== ADC <-> VOLTS CONVERSION ============================
@@ -269,8 +308,9 @@ const unsigned long FAULT_RESET_HOLD_MS = 5000; // TODO: tune to taste
 // Compressor minimum run time. Once the contacts close they stay closed for at
 // least this long, so a brief demand dip (switch bounce, a momentary timer
 // low) can't short-cycle the compressor.
-// A safety trip (12V overcurrent) still opens the contacts immediately with no
-// hold at all - this only covers a demand-driven stop.
+// There is no longer any safety trip that bypasses this hold, because the only
+// safety input the compressor has is the capacitor interlock itself. A 12V
+// overcurrent is a PUMP fault and does not touch these contacts.
 const unsigned long COMPRESSOR_MIN_RUN_MS = 5000; // TODO: tune to taste
 
 // Compressor off-delay. SEPARATE from the minimum run time above: once the
@@ -297,6 +337,18 @@ const unsigned long SWITCH_DEBOUNCE_MS = 500; // TODO: tune to taste
 // Pump anti-short-cycle hold time. 12V enable stays on this long after pump
 // demand drops, so switching modes doesn't stop/restart the pump every time.
 const unsigned long PUMP_OFF_DELAY_MS = 1000; // TODO: tune to taste
+
+// How long the pump stays cut after a stall, measured from the LAST overcurrent
+// sample rather than from the first. Restarting the clock on every overcurrent
+// sample means the hold can only elapse once the rail has been clean for the
+// whole window, so a pump that trips as soon as it is re-energised never gets
+// to run.
+//
+// Deliberately NOT reset by pump demand dropping. A stall is a real fault and
+// the hold is latched across a mode change: putting the switch to OFF and back
+// again does not buy a free restart, it just burns wall-clock time while the
+// pump stays cut.
+const unsigned long PUMP_STALL_RETRY_MS = 5000; // TODO: tune to taste
 
 // Mode change delay. A newly selected switch position is NOT acted on the
 // moment it is read: the mode actually in effect keeps running the PREVIOUS
@@ -379,6 +431,20 @@ unsigned long compressorStopRequestedAt = 0;
 // bleeds down points at a failed bleeder, and would block the next start.
 unsigned long capDischargeStart = 0;
 unsigned long lastCapDischargeMs = 0; // duration of the most completed discharge
+
+// Pump stall, from the 12V rail current exceeding PUMP_STALL_ADC_MAX. Cuts the
+// 12V enable immediately and keeps the pump cut until the rail has been clean
+// for PUMP_STALL_RETRY_MS. Separate from compressorFault on purpose: the stall
+// says nothing about the capacitor interlock, so it must not be able to latch
+// the chiller off, and the chiller interlock must not be able to clear it.
+bool pumpStalled = false;
+unsigned long pumpStallStart = 0;   // last overcurrent sample; drives the retry hold
+
+// Fan not turning, from the 12V rail current sitting below FAN_RUN_ADC_MIN
+// while the compressor runs. INERT while FAN_RUN_ADC_MIN is 0 - a reading can
+// never be below 0, so the check cannot fire until a real floor is measured.
+// Reported for visibility only; it drives no output.
+bool fanStalled = false;
 bool capDischargeTiming = false;
 
 // Buzzer tone state. The tone is started/stopped on transitions only, so
@@ -422,9 +488,11 @@ String cfgPass;
 int  readADC(uint8_t pin);
 int  readCapacitorADC();
 int  read12VCurrentADC();
-bool is12VCurrentSafe();
+bool is12VOvercurrent();
+bool isFanDrawingCurrent();
 void updateCompressorInterlock(bool wantCompressor);
-void update12VEnable(bool pumpDemandNow, bool compressorIsRunning);
+void update12VEnable(bool pumpDemandNow);
+unsigned long pumpStalledRetryMs();
 void runStateMachine();
 void readSwitchInputs();
 bool readSwitchActive(int pin);
@@ -538,8 +606,10 @@ void loop() {
   // Sole owner of the charge output and the compressor output.
   updateCompressorInterlock(compressorRequested);
 
-  // ---- 12V enable with anti-short-cycle hold ----
-  update12VEnable(pumpRequested, compressorRunning);
+  // ---- 12V enable: pump only, with anti-short-cycle hold and stall cut ----
+  // compressorRunning is deliberately NOT passed in. This pin gates the pump;
+  // the compressor runs off its own interlocked contacts.
+  update12VEnable(pumpRequested);
 
   // ---- manual test outputs for fan/buzzer (non-safety-critical) ----
   digitalWrite(PIN_FAN, (testFanOverrideActive ? testFanOverride : false) ? HIGH : LOW);
@@ -584,16 +654,32 @@ int read12VCurrentADC() {
 // Overcurrent gate on the 12V sense line. Higher reading == more current.
 // A start may not proceed, and a running compressor may not stay closed,
 // while this is false.
-bool is12VCurrentSafe() {
+// True when the 12V rail is drawing more than the pump stall ceiling - i.e. the
+// pump is jammed or shorted. This is a PUMP fault. It says nothing about the
+// compressor, which is interlocked by its capacitor, so it must never gate the
+// compressor contacts either way.
+bool is12VOvercurrent() {
   int adcValue = read12VCurrentADC();
-  bool safe = (adcValue <= COMPRESSOR_SAFE_ADC_MAX);
+  bool over = (adcValue > PUMP_STALL_ADC_MAX);
 
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= DEBUG_PRINT_INTERVAL_MS) {
-    DBG_PRINTF("[CURRENT] adc=%d limit=%d safe=%d\n", adcValue, COMPRESSOR_SAFE_ADC_MAX, safe);
+  if (over || millis() - lastPrint >= DEBUG_PRINT_INTERVAL_MS) {
+    DBG_PRINTF("[CURRENT] adc=%d stallMax=%d overcurrent=%d\n",
+               adcValue, PUMP_STALL_ADC_MAX, over ? 1 : 0);
     lastPrint = millis();
   }
-  return safe;
+  return over;
+}
+
+// True when the rail current is at or above the fan floor, i.e. the fan is
+// pulling current and so is turning. A 0 floor means "not measured yet": no
+// reading can be below 0, so this is unconditionally true and the check stays
+// inert until FAN_RUN_ADC_MIN is calibrated. Deliberately returns a bool rather
+// than comparing inline at the call site, so the disabled case is one obvious
+// place to look.
+bool isFanDrawingCurrent() {
+  if (FAN_RUN_ADC_MIN <= 0) return true; // disabled until measured
+  return read12VCurrentADC() >= FAN_RUN_ADC_MIN;
 }
 
 // =========================================================================
@@ -611,7 +697,7 @@ bool is12VCurrentSafe() {
 //                     arm a start.
 //   CHARGING       -> armed and requested: charge output HIGH, contacts still
 //                     open. Nothing closes until the capacitor is seen at/above
-//                     CAP_CHARGED_ADC_MIN and the 12V current sense is clear.
+//                     CAP_CHARGED_ADC_MIN. That is the ONLY condition.
 //   RUNNING        -> contacts closed, charge output held HIGH.
 //   Any stop       -> contacts open, charging stops, and the next start must
 //                     re-arm from a discharged capacitor.
@@ -652,6 +738,7 @@ void updateCompressorInterlock(bool wantCompressor) {
     compressorRunning = false;
     compressorStopRequestedAt = 0;
     capSeq = CAP_SEQ_WAIT_DISCHARGE;
+    fanStalled = false;
     return;
   }
 
@@ -690,10 +777,14 @@ void updateCompressorInterlock(bool wantCompressor) {
         break;
       }
 
-      // Bound the entire charging phase, not just the "not charged yet" part,
-      // so the charge output can never be left energized indefinitely if the
-      // contacts refuse to close - e.g. the capacitor reads charged but the
-      // 12V sense stays overcurrent. Latch a fault instead of sitting here.
+      // Bound the entire charging phase, not just the "not charged yet" part, so
+      // the charge output can never be left energized indefinitely if the
+      // capacitor will not charge. Latch a fault instead of sitting here.
+      //
+      // With the 12V current sense removed as a start precondition (it measures
+      // the RAIL - fan plus pump - and says nothing about the compressor's
+      // capacitor), failing to charge is the only reason the contacts stay open
+      // here, so this is now purely a "capacitor or charge path is dead" trip.
       //
       // Checked BEFORE the charge output is set HIGH, and parked LOW on the
       // trip, so the pin state is deterministic within this same iteration
@@ -704,17 +795,19 @@ void updateCompressorInterlock(bool wantCompressor) {
         digitalWrite(PIN_CAP_CHARGE, LOW);
         capSeq = CAP_SEQ_WAIT_DISCHARGE;
         compressorFault = true;
-        DBG_PRINTF("[FAULT] contacts did not close in %lums: cap=%d (need >=%d) currentSafe=%d\n",
-                   (unsigned long)PRECHARGE_TIMEOUT_MS, cap, CAP_CHARGED_ADC_MIN,
-                   is12VCurrentSafe() ? 1 : 0);
+        DBG_PRINTF("[FAULT] capacitor did not charge in %lums: cap=%d (need >=%d)\n",
+                   (unsigned long)PRECHARGE_TIMEOUT_MS, cap, CAP_CHARGED_ADC_MIN);
         break;
       }
 
       digitalWrite(PIN_CAP_CHARGE, HIGH);
 
-      if (cap >= CAP_CHARGED_ADC_MIN && is12VCurrentSafe()) {
-        // Capacitor proven charged AND the 12V sense clear of overcurrent -
-        // only now may the contacts close.
+      // Capacitor proven charged - the ONLY condition for closing the contacts.
+      // The 12V rail current is deliberately not consulted: the rail belongs to
+      // the fan and the pump, and a pump fault is handled by update12VEnable(),
+      // which cuts the pump. Gating the compressor on it would mean a stalled
+      // pump could stop the chiller, and a healthy quiet rail could stop it too.
+      if (cap >= CAP_CHARGED_ADC_MIN) {
         digitalWrite(PIN_COMPRESSOR, HIGH);
         compressorRunning = true;
         compressorRunStart = millis();
@@ -723,17 +816,21 @@ void updateCompressorInterlock(bool wantCompressor) {
       break;
 
     case CAP_SEQ_RUNNING: {
-      // Safety trip, checked before the off-delay hold so it can never be
-      // delayed by it: 12V overcurrent opens the contacts on this very loop.
-      if (!is12VCurrentSafe()) {
-        digitalWrite(PIN_COMPRESSOR, LOW);
-        digitalWrite(PIN_CAP_CHARGE, LOW);
-        compressorRunning = false;
-        compressorStopRequestedAt = 0;
-        capSeq = CAP_SEQ_WAIT_DISCHARGE;
-        DBG_PRINTLN("[CURRENT] contacts opened (overcurrent)");
-        break;
-      }
+      // The compressor's only safety trip is its own minimum run time, checked
+      // below. There is deliberately NO 12V overcurrent trip here any more: the
+      // current sense measures the rail, which is the fan and the pump, so an
+      // overcurrent is a pump fault and belongs to update12VEnable(), which cuts
+      // the pump and leaves the chiller running. A pump jam no longer stops the
+      // chiller.
+      //
+      // What replaced it is a report-only fan check. A seized fan on a running
+      // compressor will overheat it, so the floor is sampled every loop while
+      // the contacts are closed - but FAN_RUN_ADC_MIN is 0, which no reading can
+      // fall below, so this cannot fire until the floor has been measured
+      // against a real fan. It sets a flag for the web UI and does NOT open the
+      // contacts, because a spurious trip on an uncalibrated floor would stop a
+      // healthy chiller.
+      fanStalled = !isFanDrawingCurrent();
 
       // Demand still present: stay closed. This must be checked before the
       // stop-hold logic below - previously, wantCompressor==true zeroed
@@ -781,6 +878,12 @@ void updateCompressorInterlock(bool wantCompressor) {
       break;
     }
   }
+
+  // The fan floor is only meaningful while the contacts are closed, so clear it
+  // on every other path rather than letting a stale true from the last run sit
+  // on the web UI with the compressor stopped. Done here as well as in the
+  // latched-fault early return above, so there is one rule and one place.
+  if (capSeq != CAP_SEQ_RUNNING) fanStalled = false;
 }
 
 // =========================================================================
@@ -812,34 +915,90 @@ void updateBuzzerOutput() {
 }
 
 // =========================================================================
-// 12V ENABLE OUTPUT - powers the pump, anti-short-cycle.
-// Single writer of PIN_12V_EN. Stays on while the compressor is running too,
-// so the rail is never cut out from under a closed contact.
+// 12V ENABLE OUTPUT - PUMP ONLY, anti-short-cycle, stall cut.
+//
+// Single writer of PIN_12V_EN.
+//
+// This pin gates the PUMP and nothing else. It is NOT the 12V rail for the
+// whole machine, and the compressor is not fed through it - the compressor has
+// its own interlocked contacts on PIN_COMPRESSOR. So an earlier version of this
+// function ORed compressorIsRunning in "so the rail is never cut out from under
+// a closed contact"; that was wrong, and it had two bad consequences. It kept
+// the pump powered whenever the chiller ran, and - much worse - it meant there
+// was no way to cut an overcurrenting pump without also killing a running
+// chiller. The OR is gone.
+//
+// Because the pin is pump-only, a pump stall can now be handled properly and
+// locally: cut the pump on the very first overcurrent sample, keep it cut until
+// the rail has been clean for PUMP_STALL_RETRY_MS, and leave the compressor
+// untouched throughout.
 // =========================================================================
 unsigned long pumpOffTimerStart = 0;
 bool pumpOffTimerActive = false;
 
-void update12VEnable(bool pumpDemandNow, bool compressorIsRunning) {
-  bool wantEnableOn = pumpDemandNow || compressorIsRunning;
-  static bool lastWantEnableOn = false;
+// How much longer the pump stays cut. 0 when not stalled. Clamped rather than a
+// bare unsigned subtraction, so it can never report a wrapped 49-day hold.
+unsigned long pumpStalledRetryMs() {
+  if (!pumpStalled) return 0;
+  unsigned long elapsed = millis() - pumpStallStart;
+  if (elapsed >= PUMP_STALL_RETRY_MS) return 0;
+  return PUMP_STALL_RETRY_MS - elapsed;
+}
 
-  if (wantEnableOn) {
+void update12VEnable(bool pumpDemandNow) {
+  // ---- stall detection first, so the cut lands on this very loop ----
+  // is12VOvercurrent() also does the debug print, rate-limited unless it trips.
+  bool overcurrent = is12VOvercurrent();
+
+  if (overcurrent) {
+    if (!pumpStalled) {
+      DBG_PRINTF("[PUMP] 12V overcurrent, cutting 12V enable now; retry hold %lums\n",
+                 (unsigned long)PUMP_STALL_RETRY_MS);
+    }
+    pumpStalled = true;
+    // Restarted on EVERY overcurrent sample, not just the first. The retry hold
+    // is therefore measured from the last bad reading and can only elapse after
+    // the rail has been clean for the entire window - a pump that trips the
+    // instant it is re-energised never gets a second attempt.
+    pumpStallStart = millis();
+  } else if (pumpStalled && (millis() - pumpStallStart >= PUMP_STALL_RETRY_MS)) {
+    pumpStalled = false;
+    DBG_PRINTLN("[PUMP] rail clean for the retry hold, stall cleared");
+  }
+
+  // ---- now decide the pin ----
+  static bool lastPumpDemand = false;
+  bool enable = false;
+
+  if (pumpStalled) {
+    // Cut, and keep the anti-short-cycle hold from ever re-energising it. That
+    // hold exists to smooth a demand transition; honouring it here would hold an
+    // overcurrenting pump powered for up to PUMP_OFF_DELAY_MS after the fault,
+    // which is exactly the delay the stall cut exists to avoid. Cancelling it
+    // rather than pausing it also means a demand edge during a stall cannot
+    // leave a stale timer that fires later and re-enables the pin.
     pumpOffTimerActive = false;
-    digitalWrite(PIN_12V_EN, HIGH);
+  } else if (pumpDemandNow) {
+    pumpOffTimerActive = false;
+    enable = true;
   } else {
-    if (lastWantEnableOn && !pumpOffTimerActive) {
-      // demand just dropped - start the anti-short-cycle hold window
+    // Normal demand-driven stop, with the anti-short-cycle hold.
+    if (lastPumpDemand && !pumpOffTimerActive) {
       pumpOffTimerActive = true;
       pumpOffTimerStart = millis();
     }
     if (pumpOffTimerActive && (millis() - pumpOffTimerStart < PUMP_OFF_DELAY_MS)) {
-      digitalWrite(PIN_12V_EN, HIGH); // still holding on during the delay
+      enable = true; // still holding on during the delay
     } else {
-      digitalWrite(PIN_12V_EN, LOW);
       pumpOffTimerActive = false;
     }
   }
-  lastWantEnableOn = wantEnableOn;
+
+  digitalWrite(PIN_12V_EN, enable ? HIGH : LOW);
+  // Tracks DEMAND, not the final pin state. Edge-detecting on the pin instead
+  // would miss a demand drop that happened while a stall was cutting the pump,
+  // and the anti-short-cycle hold would then never start.
+  lastPumpDemand = pumpDemandNow;
 }
 
 // =========================================================================
@@ -1402,9 +1561,17 @@ void handleStatusJson() {
         ? (COMPRESSOR_OFF_DELAY_MS - (millis() - compressorStopRequestedAt)) : 0) + ",";
   json += "\"currentAdc\":" + String(currentAdcValue) + ",";
   json += "\"currentVolts\":" + String(currentAdcToVolts(currentAdcValue), 2) + ",";
-  json += "\"currentLimit\":" + String(COMPRESSOR_SAFE_ADC_MAX) + ",";
-  json += "\"currentLimitVolts\":" + String(currentAdcToVolts(COMPRESSOR_SAFE_ADC_MAX), 2) + ",";
-  json += "\"currentSafe\":" + String(is12VCurrentSafe() ? "true" : "false") + ",";
+  json += "\"pumpStallLimit\":" + String(PUMP_STALL_ADC_MAX) + ",";
+  json += "\"pumpStallLimitVolts\":" + String(currentAdcToVolts(PUMP_STALL_ADC_MAX), 2) + ",";
+  json += "\"fanRunMin\":" + String(FAN_RUN_ADC_MIN) + ",";
+  json += "\"fanRunMinVolts\":" + String(currentAdcToVolts(FAN_RUN_ADC_MIN), 2) + ",";
+  json += "\"pumpStalled\":" + String(pumpStalled ? "true" : "false") + ",";
+  // Guarded rather than trusting the subtraction: update12VEnable() runs earlier
+  // in this same loop and clears pumpStalled the moment the hold elapses, so
+  // elapsed is always below the hold here - but an unsigned underflow would show
+  // up as a 49-day countdown in the UI, so clamp rather than rely on it.
+  json += "\"pumpStallRetryRemainingMs\":" + String(pumpStalledRetryMs()) + ",";
+  json += "\"fanStalled\":" + String(fanStalled ? "true" : "false") + ",";
   json += "\"fan\":" + String(digitalRead(PIN_FAN) == HIGH ? "true" : "false") + ",";
   json += "\"buzzer\":" + String(digitalRead(PIN_BUZZER) == HIGH ? "true" : "false") + ",";
   json += "\"buzzerHz\":" + String(buzzerFrequency) + ",";
@@ -1499,18 +1666,20 @@ void handleSetThresholds() {
   server.send(200, "text/plain", "ok");
 }
 
-// 12V current-sense overcurrent limit, accepted in volts. Converted here so the
-// authoritative value the gate uses stays in raw ADC counts.
+// 12V rail pump-stall ceiling, accepted in volts. Converted here so the
+// authoritative value the pump logic uses stays in raw ADC counts.
 void handleSetCurrentLimit() {
   if (!server.hasArg("volts")) {
     server.send(400, "text/plain", "need volts");
     return;
   }
   int newLimit = currentVoltsToAdc(server.arg("volts").toFloat());
-  if (newLimit < 1) newLimit = 1; // a limit of 0 counts would never be safe
-  COMPRESSOR_SAFE_ADC_MAX = newLimit;
+  if (newLimit < 1) newLimit = 1; // a ceiling of 0 would trip on any reading
+  // The prefs key stays "adcmax" on purpose: it is the same number as before,
+  // only the thing it means has changed, so existing calibration carries over.
+  PUMP_STALL_ADC_MAX = newLimit;
   prefs.begin("chiller", false);
-  prefs.putInt("adcmax", COMPRESSOR_SAFE_ADC_MAX);
+  prefs.putInt("adcmax", PUMP_STALL_ADC_MAX);
   prefs.end();
   server.send(200, "text/plain", "ok");
 }
@@ -1543,7 +1712,7 @@ void loadSettings() {
   prefs.begin("chiller", false);
   cfgSsid = prefs.getString("ssid", MYSSIDIOT);
   cfgPass = prefs.getString("pass", MYPSKIOT);
-  COMPRESSOR_SAFE_ADC_MAX = prefs.getInt("adcmax", COMPRESSOR_SAFE_ADC_MAX);
+  PUMP_STALL_ADC_MAX = prefs.getInt("adcmax", PUMP_STALL_ADC_MAX);
   CAP_DISCHARGED_ADC_MAX  = prefs.getInt("capdis", CAP_DISCHARGED_ADC_MAX);
   CAP_CHARGED_ADC_MIN    = prefs.getInt("capchg", CAP_CHARGED_ADC_MIN);
   buzzerFrequency        = prefs.getInt("buzzerhz", buzzerFrequency);

@@ -103,8 +103,11 @@ const char PAGE_STATUS[] PROGMEM = R"====(
   </div>
 
   <div style="font-weight:bold;margin:16px 0 4px">12V current sense (GPIO2)</div>
+  <div style="color:#888;font-size:11px;margin-bottom:4px">
+    Rail monitor: fan + pump. Ceiling = pump stall. Floor = fan turning.
+  </div>
   <div>
-    Overcurrent limit
+    Pump stall ceiling
     <input type="number" id="vcur" step="0.01" min="0" max="3.3"> V
   </div>
   <div style="margin-top:8px">
@@ -328,7 +331,7 @@ function refresh() {
     updateDial(d);
     setInput('vdis', d.capDischargedVolts, 'v');
     setInput('vchg', d.capChargedVolts, 'v');
-    setInput('vcur', d.currentLimitVolts, 'c');
+    setInput('vcur', d.pumpStallLimitVolts, 'c');
     setInput('bhz', d.buzzerHz, 'hz');
     html += row('Mode', modeSpan(d.mode));
     if (d.modeChangeRemainingMs > 0) {
@@ -344,10 +347,22 @@ function refresh() {
     html += row('Cap discharging', d.capDischarging
                 ? '<span class="ok">' + fmtMs(d.capDischargeMs) + ' and counting</span>'
                 : 'no &middot; last took ' + fmtMs(d.capLastDischargeMs));
-    html += row('12V current', d.currentVolts + ' V <span class="gpio">adc ' + d.currentAdc + '</span> &middot; trips &gt; ' +
-                d.currentLimitVolts + ' V <span class="gpio">adc ' + d.currentLimit + '</span>' +
-                (d.currentSafe ? ' <span class="ok">SAFE</span>' : ' <span class="bad">OVERCURRENT</span>') +
+    html += row('12V rail current', d.currentVolts + ' V <span class="gpio">adc ' + d.currentAdc + '</span>' +
+                ' &middot; pump stall ceiling ' + d.pumpStallLimitVolts + ' V' +
+                ' <span class="gpio">adc ' + d.pumpStallLimit + '</span>' +
+                ' &middot; fan floor ' +
+                (d.fanRunMin > 0 ? d.fanRunMinVolts + ' V <span class="gpio">adc ' + d.fanRunMin + '</span>'
+                                 : '<span class="gpio">not measured</span>') +
                 ' <span class="gpio">uncalibrated</span>', p.currentSense);
+    if (d.pumpStalled) {
+      html += row('Pump', '<span class="bad">STALLED</span> &middot; cut now, retrying in ' +
+                  fmtMs(d.pumpStallRetryRemainingMs) +
+                  ' <span class="gpio">chiller unaffected</span>', p.currentSense);
+    }
+    if (d.fanStalled) {
+      html += row('Fan', '<span class="bad">NOT DRAWING</span> &middot; sensor or seized fan, report only',
+                  p.fan);
+    }
     html += row('Fault', d.fault ? '<span class="bad">LATCHED</span>' : '<span>none</span>');
     html += row('Fan', boolCell(d.fan) + (d.testFanActive ? ' (manual)' : ''), p.fan);
     html += row('Buzzer', boolCell(d.buzzerToneActive) + ' &middot; pulsed at ' + d.buzzerHz + ' Hz' +
