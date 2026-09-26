@@ -10,7 +10,9 @@
     GPIO1   - Capacitor charge output (LOW at boot)
     GPIO2   - ADC: 12V rail current sense (pump stall ceiling / fan floor)
     GPIO3   - Switch position 3 input (CHILLER ONLY) [active low, pull-up]
-    GPIO4   - Timer on/off input
+    GPIO4   - SYSTEM ENABLE input from the external mechanical timer
+              [ACTIVE LOW, pull-up: pin HIGH = timer idle, pin pulled LOW =
+              timer's enable contact closed = system enabled]
     GPIO5   - Fan output
     GPIO6   - Buzzer output
     GPIO7   - 12V enable output (powers the pump)
@@ -33,6 +35,29 @@
     A newly selected position is NOT acted on straight away - the previous
     position keeps running for MODE_SWITCH_DELAY_MS first, so the outputs as
     well as the LEDs wait it out. See updateModeSelection().
+
+  SYSTEM ENABLE (external mechanical timer, GPIO4):
+    GPIO4 is NOT a microcontroller timer and has nothing to do with the
+    software timeouts in this sketch. It is a single input wired to the
+    enable contact of an EXTERNAL MECHANICAL TIMER - the kind with a real
+    clock dial that a person winds up and that closes a contact for a set
+    number of hours. The timer is the master on/off for the whole machine.
+    Its contact is normally OPEN, so the pin idles HIGH, and the timer pulls
+    it LOW while it is running. The input is therefore ACTIVE LOW and is
+    configured with an internal pull-UP.
+    The switch says WHICH loads to run; the mechanical timer says WHETHER to
+    run anything at all. Both are required, in every mode, with no exceptions:
+      - Nothing starts unless the timer's enable contact is closed. On boot,
+        or with the timer wound down, the switch can be sitting in CHILLER
+        and the outputs are still configured but completely idle.
+      - PUMP_ONLY is gated by it too, not just the compressor path.
+    If the timer's contact OPENS mid-run, the outputs are deliberately kept
+    running for SYSTEM_ENABLE_HOLD_MS (2 minutes) so the user has a chance to
+    wind the timer or move the switch and pick the run back up without a
+    cold restart. Moving the mode switch re-arms that window, including moving
+    it to a different mode and straight back again, which is the intended way
+    to restart. The status LEDs keep animating throughout, so a machine
+    sitting in that window looks alive rather than switched off.
 
   STATUS LED RING:
     LED_COUNT WS2812Bs joined into a circle, one animation per mode: blue
@@ -144,11 +169,11 @@ bool wifiReconnectRequested = false;
 #define PIN_CAP_SENSE  0   // ADC1 channel, capacitor voltage sense
 #define PIN_CAP_CHARGE 1   // capacitor charge output, LOW at boot
 #define PIN_ADC_12V    2   // ADC1 channel, 12V current sense
-#define PIN_TIMER_IN   4   // timer on/off input
+#define PIN_SYSTEM_ENABLE 4  // external mechanical timer's enable contact
 #define PIN_FAN        5
-#define PIN_BUZZER     6
+#define PIN_BUZZER     8
 #define PIN_12V_EN     7   // 12V enable - PUMP ONLY, not the whole rail
-#define PIN_COMPRESSOR 8
+#define PIN_COMPRESSOR 6
 #define PIN_5V_EN      9
 
 // Mode-select switch inputs (one-of-four rotary/slide switch), active low.
@@ -306,8 +331,8 @@ const unsigned long PRECHARGE_TIMEOUT_MS = 30000; // TODO: tune to taste
 const unsigned long FAULT_RESET_HOLD_MS = 5000; // TODO: tune to taste
 
 // Compressor minimum run time. Once the contacts close they stay closed for at
-// least this long, so a brief demand dip (switch bounce, a momentary timer
-// low) can't short-cycle the compressor.
+// least this long, so a brief demand dip (switch bounce, the mechanical
+// timer's contact flickering) can't short-cycle the compressor.
 // There is no longer any safety trip that bypasses this hold, because the only
 // safety input the compressor has is the capacitor interlock itself. A 12V
 // overcurrent is a PUMP fault and does not touch these contacts.
@@ -371,6 +396,28 @@ const unsigned long MODE_SWITCH_DELAY_MS = 3000;
 int buzzerFrequency = 2000;                 // persisted, settable from the web UI
 const int BUZZER_FREQ_MIN = 100;
 const int BUZZER_FREQ_MAX = 8000;
+
+// The two feedback sounds. A short click the instant a new switch position is
+// accepted, and a longer buzz when the mode actually takes effect at the end of
+// the MODE_SWITCH_DELAY_MS wipe. Both are one-shot and non-blocking - the tone is
+// started once and left to run to its deadline, so nothing on the safety path
+// ever waits on them.
+const unsigned long BUZZER_POSITION_CLICK_MS = 40;   // very short: a switch click
+const unsigned long BUZZER_MODE_START_MS     = 500;  // longer: mode accepted
+
+// How long the outputs keep running after the external mechanical timer's enable
+// contact OPENS, before everything is released. This is a restart window, not a
+// minimum run time: the user has SYSTEM_ENABLE_HOLD_MS to wind the timer back up,
+// or to move the mode switch (which re-arms the window - see
+// updateSystemEnable()) and pick the run back up without the compressor going
+// through a full stop, capacitor discharge and re-charge.
+//
+// It gates DEMAND only. It cannot switch an output on by itself, and it cannot
+// delay the compressor's own protections: the capacitor interlock and the
+// PRECHARGE_TIMEOUT_MS fault both act inside updateCompressorInterlock() on every
+// loop regardless of demand. It also cannot delay a pump stall cut, which
+// update12VEnable() applies on the first overcurrent sample.
+const unsigned long SYSTEM_ENABLE_HOLD_MS = 120000;  // 2 minutes
 
 // ============================ MODES / STATE ==============================
 enum ChillerMode {
@@ -453,13 +500,15 @@ bool buzzerToneActive = false;
 
 // Switch debounce state, one entry per position. Reads raw from the pin but
 // only publishes switchNState once the raw value has been stable for
-// SWITCH_DEBOUNCE_MS.
-struct DebouncedSwitch {
+// SWITCH_DEBOUNCE_MS. Used for the mode switch positions AND for the external
+// mechanical timer's enable contact, which is debounced the same way.
+struct DebouncedInput {
   bool stable = false;            // last accepted value
   bool candidate = false;         // value currently being confirmed
   unsigned long candidateSince = 0;
 };
-DebouncedSwitch switchDebounce[4];
+DebouncedInput switchDebounce[4];
+DebouncedInput systemEnableDebounce;
 const uint8_t SWITCH_COUNT = 4;
 
 // Switch position states, updated each loop by readSwitchInputs()
@@ -467,6 +516,23 @@ bool switch1State = false;
 bool switch2State = false;
 bool switch3State = false;
 bool switch4State = false;
+
+// SYSTEM ENABLE - the external mechanical timer's contact, ACTIVE LOW.
+// High = timer's contact open = timer idle, which is the resting state. The
+// timer pulls the pin LOW while its contact is closed, i.e. while the timer is
+// running, and that is the only thing that permits any output to start.
+//
+// systemEnableState is the debounced pin reading. systemEnableLostAt is stamped
+// the moment that reading goes from enabled to idle, and is 0 whenever no
+// restart window is pending. See updateSystemEnable() and applyMode().
+bool systemEnableState = false;
+unsigned long systemEnableLostAt = 0;
+
+// True only on the loops where a mode switch position was actually accepted as
+// new, so the click and the enable-hold re-arm fire once per movement instead of
+// once per loop. Set by readSwitchInputs().
+bool switchMovedThisLoop = false;
+uint8_t lastSwitchMask = 0;
 
 // Manual test overrides, settable from the web UI (see /test/* handlers).
 bool testFanOverride       = false;
@@ -497,7 +563,13 @@ void runStateMachine();
 void readSwitchInputs();
 bool readSwitchActive(int pin);
 void setupSwitchPin(int pin);
-void updateDebounced(DebouncedSwitch &d, bool raw);
+void updateDebounced(DebouncedInput &d, bool raw);
+bool readSystemEnableActive();
+void updateSystemEnable();
+bool systemAllowsRun();
+unsigned long systemEnableHoldRemaining();
+void buzzOnce(unsigned long durationMs, bool isModeStart);
+bool buzzRunning();
 ChillerMode getSwitchMode();
 void updateModeSelection(ChillerMode selected);
 void applyMode();
@@ -555,13 +627,17 @@ void setup() {
   digitalWrite(PIN_5V_EN, HIGH);     pinMode(PIN_5V_EN, OUTPUT);
   pinMode(PIN_CAP_SENSE, INPUT);   // analog: capacitor voltage sense
   pinMode(PIN_ADC_12V, INPUT);     // analog: 12V current sense
-  // Timer input is treated as active-HIGH (see applyMode()). Configured with
-  // an explicit pull-DOWN so an unwired or floating timer deterministically
-  // reads LOW = inactive, which blocks compressor demand, instead of randomly
-  // enabling or disabling the chiller.
-  // TODO: confirm against the real timer circuit. If it needs a pull-UP
-  // instead, change this and the read in applyMode() together.
-  pinMode(PIN_TIMER_IN, INPUT_PULLDOWN);
+  // SYSTEM ENABLE, from the external mechanical timer on GPIO4 - ACTIVE LOW.
+  // The timer's enable contact is normally open and idles the pin HIGH; the
+  // timer pulls it LOW for as long as it is running. Same arrangement as the
+  // mode switch positions below: an internal pull-up, and "enabled" means the
+  // pin is shorted to GND.
+  //
+  // The pull-up matters here more than anywhere else. With the timer not
+  // connected, or wound down, the pin floats HIGH = not enabled, and nothing
+  // runs in any mode. There is no wiring arrangement of this input that lets
+  // the machine start itself by accident.
+  pinMode(PIN_SYSTEM_ENABLE, INPUT_PULLUP);
 
   // Mode-select switch inputs - ACTIVE LOW: the switch shorts the pin to GND
   // to close its position, internal pull-up holds it HIGH when open. Positions
@@ -593,11 +669,15 @@ void setup() {
 void loop() {
   // ---- read inputs first ----
   readSwitchInputs();
+  // The external mechanical timer's contact, and the restart window it opens
+  // when that contact drops. Read before applyMode() so the demand flags below
+  // already reflect it.
+  updateSystemEnable();
   // A newly selected position is held back for MODE_SWITCH_DELAY_MS before it
   // becomes the mode in effect, so it gates the demand flags below as well as
   // the LED ring.
   updateModeSelection(getSwitchMode());
-  applyMode(); // sets compressorRequested / pumpRequested from mode + overrides
+  applyMode(); // sets compressorRequested / pumpRequested from mode + enable + overrides
 
   // ---- fault latch / display state, derived from the interlock ----
   runStateMachine();
@@ -706,9 +786,11 @@ bool isFanDrawingCurrent() {
 //                     COMPRESSOR_OFF_DELAY_MS after demand is removed. Demand
 //                     returning inside that second window clears the pending
 //                     stop, so the compressor resumes the SAME run: no stop, no
-//                     discharge, no re-charge. Overcurrent is checked BEFORE
-//                     either hold, so a safety trip still opens the contacts
-//                     immediately.
+//                     discharge, no re-charge. Note that the 12V current sense is
+//                     NOT consulted here: it measures the rail (fan + pump), and
+//                     a rail overcurrent is a pump fault handled by
+//                     update12VEnable(), which cuts the pump and deliberately
+//                     leaves a running chiller alone.
 //   Contacts not closed within PRECHARGE_TIMEOUT_MS of charging starting ->
 //                     latched fault. This bounds the whole charging phase, not
 //                     just the "not charged yet" part, so the charge output
@@ -894,9 +976,36 @@ void updateCompressorInterlock(bool wantCompressor) {
 // non-blocking, so the pulsing costs nothing on the safety-critical path -
 // tone()/noTone() are only called on an actual on/off transition, never per
 // loop.
-// =========================================================================
+//
+// Two one-shot feedback sounds ride on top of the manual test override:
+// BUZZER_POSITION_CLICK_MS when a switch position is accepted, and
+// BUZZER_MODE_START_MS when the mode actually takes effect. Each is armed as a
+// start time plus a duration, so the loop only ever compares millis() against a
+// deadline - nothing waits, and a buzz left unfinished by a new event is simply
+// cut off or superseded by the next one.
+unsigned long buzzStartAt = 0;
+unsigned long buzzDurationMs = 0;
+bool buzzActive = false;
+bool buzzIsModeStart = false; // a start buzz outranks a click
+
+// Arm a one-shot buzz. A click will not interrupt a start buzz already playing -
+// the longer, more meaningful sound finishes, rather than being chopped into a
+// stutter by switch contact noise.
+void buzzOnce(unsigned long durationMs, bool isModeStart) {
+  if (buzzActive && buzzIsModeStart && !isModeStart) return;
+  buzzActive = true;
+  buzzIsModeStart = isModeStart;
+  buzzStartAt = millis();
+  buzzDurationMs = durationMs;
+}
+
+bool buzzRunning() {
+  return buzzActive && (millis() - buzzStartAt) < buzzDurationMs;
+}
+
 void updateBuzzerOutput() {
-  bool wantTone = testBuzzerOverrideActive && testBuzzerOverride;
+  if (!buzzRunning()) buzzActive = false;
+  bool wantTone = (testBuzzerOverrideActive && testBuzzerOverride) || buzzRunning();
 
   if (wantTone) {
     if (!buzzerToneActive) {
@@ -1018,7 +1127,7 @@ bool readSwitchActive(int pin) {
 // Publish `raw` as the accepted value only once it has been stable for
 // SWITCH_DEBOUNCE_MS. Any change restarts the window, so a bouncing contact
 // never reaches the mode selection.
-void updateDebounced(DebouncedSwitch &d, bool raw) {
+void updateDebounced(DebouncedInput &d, bool raw) {
   if (raw != d.candidate) {
     // Different from the reading being confirmed - restart the window.
     d.candidate = raw;
@@ -1046,6 +1155,94 @@ void readSwitchInputs() {
   switch2State = states[1];
   switch3State = states[2];
   switch4State = states[3];
+
+  // Movement detection, as a bitmask over the accepted switch readings rather
+  // than over the selected mode. A bitmask catches a switch that goes to a
+  // different position and straight back again, which a mode comparison would
+  // miss entirely - and "nudge it off and back" is exactly how the user
+  // restarts a run that the external mechanical timer has cut out, so it has to
+  // be detected even though the mode ends up unchanged.
+  uint8_t mask = (switch1State ? 1 : 0) | (switch2State ? 2 : 0) |
+                 (switch3State ? 4 : 0) | (switch4State ? 8 : 0);
+  switchMovedThisLoop = (mask != lastSwitchMask);
+  lastSwitchMask = mask;
+
+  if (switchMovedThisLoop) buzzOnce(BUZZER_POSITION_CLICK_MS, false);
+}
+
+// =========================================================================
+// SYSTEM ENABLE - the external mechanical timer's contact on GPIO4
+//
+// This is an input from a mechanical time switch wired to the machine, NOT one
+// of the microcontroller's own timers and NOT related to any of the software
+// timeouts elsewhere in this sketch. It carries a single bit: is the timer
+// running, or not.
+//
+// ACTIVE LOW, matching the internal pull-up in setup(): the timer's enable
+// contact is normally open and idles the pin HIGH, and the timer pulls it LOW
+// for as long as it is running. The resting state - timer wound down, or the
+// wire not yet connected - is therefore "system not enabled", which is the
+// safe direction: nothing can start.
+//
+// Debounced with the same filter as the mode switch, because it is a mechanical
+// contact and will bounce exactly as the switch does.
+// =========================================================================
+bool readSystemEnableActive() {
+  return digitalRead(PIN_SYSTEM_ENABLE) == LOW;
+}
+
+// How much of the restart window is left, in ms. 0 when the timer is enabled or
+// when no window is pending.
+unsigned long systemEnableHoldRemaining() {
+  if (systemEnableLostAt == 0) return 0;
+  unsigned long elapsed = millis() - systemEnableLostAt;
+  if (elapsed >= SYSTEM_ENABLE_HOLD_MS) return 0;
+  return SYSTEM_ENABLE_HOLD_MS - elapsed;
+}
+
+// Owns the restart window. Called every loop before applyMode().
+//
+// The window opens when the timer's contact opens (the timer stops) and holds
+// the demand up for SYSTEM_ENABLE_HOLD_MS so the user can wind the timer or move
+// the mode switch to pick the run back up. Two things close or re-arm it:
+//
+//   - The timer's contact closing again. The window is simply dropped, because
+//     the timer is running and the normal gating takes over.
+//   - The mode switch moving. This RE-ARMS the window rather than closing it,
+//     and that is deliberate: moving the switch is the user restarting, so they
+//     get a fresh SYSTEM_ENABLE_HOLD_MS from the moment they touched it. It also
+//     works when the switch goes to another position and straight back, because
+//     it is driven off the movement bitmask rather than the mode value.
+//
+// This only ever gates DEMAND. It cannot switch an output on by itself, and it
+// cannot delay the compressor's own protections - the capacitor interlock and the
+// precharge fault both act every loop regardless of demand - nor a pump stall
+// cut, which update12VEnable() applies on the first overcurrent sample.
+void updateSystemEnable() {
+  updateDebounced(systemEnableDebounce, readSystemEnableActive());
+  bool enabled = systemEnableDebounce.stable;
+
+  if (enabled) {
+    systemEnableLostAt = 0; // timer running: no window needed
+  } else if (systemEnableState && systemEnableLostAt == 0) {
+    // First loop after the timer's contact opened. Open the window once.
+    systemEnableLostAt = millis();
+    DBG_PRINTF("[ENABLE] timer contact opened, holding outputs for %lums\n",
+               (unsigned long)SYSTEM_ENABLE_HOLD_MS);
+  } else if (systemEnableLostAt != 0 && switchMovedThisLoop) {
+    // The user is touching the switch during the window, so re-arm it.
+    systemEnableLostAt = millis();
+    DBG_PRINTLN("[ENABLE] switch moved during hold, restart window re-armed");
+  }
+
+  systemEnableState = enabled;
+}
+
+// The single answer to "may anything run right now", used by applyMode() for
+// EVERY mode. True when the mechanical timer's contact is closed, or while the
+// restart window after it opened is still running out.
+bool systemAllowsRun() {
+  return systemEnableState || systemEnableHoldRemaining() > 0;
 }
 
 ChillerMode getSwitchMode() {
@@ -1087,27 +1284,35 @@ void updateModeSelection(ChillerMode selected) {
   if (currentMode == selectedMode) return;                  // already caught up
   if (millis() - modeChangeStart < MODE_SWITCH_DELAY_MS) return; // still holding
   currentMode = selectedMode;
+  // The mode has now actually taken effect - the same tick the last LED of the
+  // wipe lights up. This is the acknowledgement buzz, so it lands with the end
+  // of the LED wipe rather than with the moment the switch was moved.
+  buzzOnce(BUZZER_MODE_START_MS, true);
+  DBG_PRINTF("[MODE] now %s\n", modeName());
 }
 
 void applyMode() {
-  // Active level matches the INPUT_PULLDOWN in setup(): HIGH = timer on. With
-  // the pin unwired the pull-down holds this LOW, so chiller demand is blocked
-  // rather than floating.
-  // TODO: confirm the timer should gate compressor demand at all, and how it
-  // should combine with the switch mode.
-  bool timerEnabled = (digitalRead(PIN_TIMER_IN) == HIGH);
+  // The external mechanical timer gates EVERY mode, not just the compressor.
+  // The switch chooses WHICH loads run; the timer decides WHETHER anything runs
+  // at all. With its contact open, or absent entirely, both demand flags stay
+  // false in PUMP_ONLY as well as the chiller modes - so on boot with the
+  // switch already in CHILLER the outputs are configured but completely idle,
+  // which is the required resting state.
+  bool systemEnabled = systemAllowsRun();
 
   bool modePump     = (currentMode == MODE_PUMP_ONLY || currentMode == MODE_BOTH);
-  bool modeChiller   = (currentMode == MODE_CHILLER_ONLY || currentMode == MODE_BOTH);
+  bool modeChiller  = (currentMode == MODE_CHILLER_ONLY || currentMode == MODE_BOTH);
 
-  pumpRequested = modePump;
-  compressorRequested = modeChiller && timerEnabled; // TODO: confirm timer should gate compressor demand
+  pumpRequested = modePump && systemEnabled;
+  compressorRequested = modeChiller && systemEnabled;
 
   // Manual test overrides from the web UI take priority for the compressor
   // demand path only. This only sets the DEMAND flag - it cannot reach the
-  // compressor output, which stays behind updateCompressorInterlock().
+  // compressor output, which stays behind updateCompressorInterlock(). The
+  // system enable still gates it, so an override cannot start the compressor
+  // while the mechanical timer's contact is open.
   if (testCompressorDemandOverrideActive) {
-    compressorRequested = testCompressorDemandOverride;
+    compressorRequested = testCompressorDemandOverride && systemEnabled;
   }
 }
 
@@ -1584,6 +1789,12 @@ void handleStatusJson() {
   json += "\"switch2\":" + String(switch2State ? "true" : "false") + ",";
   json += "\"switch3\":" + String(switch3State ? "true" : "false") + ",";
   json += "\"switch4\":" + String(switch4State ? "true" : "false") + ",";
+  // System enable = the external mechanical timer's contact, active low. The
+  // three fields together say whether anything is permitted to run right now,
+  // and if not, how much of the restart window is left.
+  json += "\"systemEnable\":" + String(systemEnableState ? "true" : "false") + ",";
+  json += "\"systemEnableHold\":" + String(systemEnableHoldRemaining() > 0 ? "true" : "false") + ",";
+  json += "\"systemEnableHoldRemainingMs\":" + String(systemEnableHoldRemaining()) + ",";
   json += "\"testFanActive\":" + String(testFanOverrideActive ? "true" : "false") + ",";
   json += "\"testBuzzerActive\":" + String(testBuzzerOverrideActive ? "true" : "false") + ",";
   json += "\"testCompressorActive\":" + String(testCompressorDemandOverrideActive ? "true" : "false") + ",";
@@ -1598,7 +1809,8 @@ void handleStatusJson() {
   json += "\"switch1\":\""      + pinLevel(PIN_SWITCH_1)             + "\",";
   json += "\"switch2\":\""      + pinLevel(PIN_SWITCH_2)             + "\",";
   json += "\"switch3\":\""      + pinLevel(PIN_SWITCH_3)             + "\",";
-  json += "\"switch4\":\""      + pinLevel(PIN_SWITCH_4)             + "\"";
+  json += "\"switch4\":\""      + pinLevel(PIN_SWITCH_4)             + "\",";
+  json += "\"systemEnable\":\"" + pinLevel(PIN_SYSTEM_ENABLE)        + "\"";
   json += "}";
   json += "}";
   server.send(200, "application/json", json);

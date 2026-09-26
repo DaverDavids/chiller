@@ -14,7 +14,7 @@ status and manual function testing.
 | 1    | Capacitor charge output                | LOW |
 | 2    | ADC - 12V current sense (input)        | n/a |
 | 3    | Switch position 3 - chiller only, active low | n/a |
-| 4    | Timer on/off input                    | n/a |
+| 4    | System enable (external mechanical timer) | n/a |
 | 5    | Fan output                            | LOW |
 | 6    | Buzzer output                         | LOW |
 | 7    | 12V enable output (PUMP ONLY)          | LOW |
@@ -33,6 +33,75 @@ is assigned. `MODE_OFF` is still reachable through the fail-safe path in
 GPIO21 was previously the hardware UART0 TX pin on most supermini boards, so
 Serial debug has to run over the native USB port (GPIO18/19) with the LED data
 line on 21.
+
+## System enable (external mechanical timer, GPIO4)
+
+**This is not a microcontroller timer.** GPIO4 is unrelated to `millis()`, to the
+ESP32's hardware timers, and to every software timeout in this sketch
+(`MODE_SWITCH_DELAY_MS`, `PRECHARGE_TIMEOUT_MS`, and so on). It is a single input
+wired to the **enable contact of an external mechanical timer** - the kind with a
+real clock dial that a person winds up, which then closes a contact for a set
+number of hours. The mechanical timer is the master on/off for the whole machine.
+
+| Switch says | Mechanical timer says | Result |
+| --- | --- | --- |
+| which loads to run | whether anything runs at all | both required |
+
+### Active level
+
+The timer's contact is **normally open**, so the pin idles **HIGH** with the timer
+wound down, and the timer pulls it **LOW** for as long as it is running. The input
+is therefore **ACTIVE LOW** and is configured `INPUT_PULLUP` - the same arrangement
+as the mode switch positions.
+
+This matters more here than on any other input. The resting state - timer not
+connected, or wound down - reads as *not enabled*, so **there is no wiring of this
+input that lets the machine start itself by accident.**
+
+### Nothing starts without it, in any mode
+
+The gate applies to **every** mode, not just the compressor. With the timer's
+contact open:
+
+- `PUMP_ONLY` is held off as well as the chiller modes.
+- On boot, with the switch already sitting in `CHILLER`, every output is
+  configured but completely idle. The capacitor interlock sits in
+  `WAIT_DISCHARGE` and the 12V enable stays low.
+- The manual `/test/compressor` override cannot bypass it either - it sets the
+  demand flag, and the demand flag is gated.
+
+### The 2-minute restart window
+
+If the timer's contact **opens mid-run**, the outputs are deliberately kept running
+for `SYSTEM_ENABLE_HOLD_MS` (**2 minutes**). This is a restart window, not a
+minimum run time: the user has two minutes to wind the timer back up, or to move
+the mode switch, and pick the run back up **without the compressor going through a
+full stop, capacitor discharge and re-charge**.
+
+- Moving the mode switch **re-arms** the window - it gets a fresh 2 minutes from
+  the moment it is touched. This works when the switch goes to a different
+  position and straight back again, which is the intended restart gesture. It is
+  driven off a bitmask over the accepted switch readings rather than the mode
+  value, precisely so "nudge it off and back" is detected even though the mode
+  ends up unchanged.
+- The status LEDs keep animating throughout, so a machine sitting in the window
+  looks alive rather than switched off.
+- The window is dropped as soon as the timer's contact closes again.
+
+It gates **demand only**, and cannot postpone the compressor's own protections:
+the capacitor interlock and the `PRECHARGE_TIMEOUT_MS` fault both act every loop
+regardless of demand. It also cannot delay a pump stall cut, which is applied on
+the first overcurrent sample.
+
+### Feedback sounds
+
+- A short click (`BUZZER_POSITION_CLICK_MS`, 40ms) the instant a new switch
+  position is accepted.
+- A longer buzz (`BUZZER_MODE_START_MS`, 500ms) when the mode actually takes
+  effect, at the end of the `MODE_SWITCH_DELAY_MS` wipe - the same tick the last
+  LED lights up. A click will not interrupt a start buzz already playing.
+
+Both are one-shot and non-blocking, armed as a start time plus a duration.
 
 ## Capacitor interlock (the compressor start path)
 
@@ -147,6 +216,21 @@ not disturb the safety-critical path. The frequency is settable from the web UI
 (100-8000 Hz, default 2000) and is persisted to flash. Changing it while a tone
 is running re-issues the tone immediately rather than waiting for the next
 on/off transition.
+
+Two one-shot feedback sounds ride on top of the manual test override, both
+non-blocking and armed as a start time plus a duration:
+
+| Sound | Length | Fires when |
+| --- | --- | --- |
+| Position click | `BUZZER_POSITION_CLICK_MS` (40 ms) | a new switch position is accepted |
+| Mode start | `BUZZER_MODE_START_MS` (500 ms) | the mode actually takes effect |
+
+The click lands the moment a debounced position change is accepted. The start
+buzz lands at the **end** of the `MODE_SWITCH_DELAY_MS` wipe, on the same tick
+the last LED lights up, so it acknowledges the mode actually starting rather than
+the switch being touched. A click will not interrupt a start buzz that is already
+playing - the longer, more meaningful sound finishes rather than being chopped up
+by contact noise.
 
 ## Calibration inputs (volts + raw ADC)
 
@@ -340,6 +424,28 @@ The web UI shows both the switch position and the mode in effect while the hold
 is running, with a countdown, so the delay reads as a deliberate wait rather
 than the switch having been ignored.
 
+## Is there a delay before things actually start?
+
+Yes - two of them, and they are different in kind.
+
+| Delay | Length | Applies to |
+| --- | --- | --- |
+| `MODE_SWITCH_DELAY_MS` | 3 s | every mode change, all outputs |
+| capacitor discharge + charge | seconds, up to `PRECHARGE_TIMEOUT_MS` (30 s) then a latched fault | compressor contacts only |
+
+- **The pump has no start delay of its own.** Once the 3 s mode hold clears, the
+  12V enable goes high on the next loop.
+- **The compressor is deliberately slow**, and the delay is the safety feature
+  rather than a nuisance. The contacts cannot close until the capacitor has been
+  *seen* at or below `CAP_DISCHARGED_ADC_MAX` **and** then brought back up to
+  `CAP_CHARGED_ADC_MIN`. So after any stop there is a real discharge wait, then a
+  real charge wait. If the capacitor will not charge within
+  `PRECHARGE_TIMEOUT_MS` the attempt is abandoned and a fault latches rather than
+  the contacts closing on an unproven capacitor.
+- **The system enable can veto the whole thing at any point** - see the system
+  enable section. With the mechanical timer's contact open, nothing starts
+  regardless of which mode is selected.
+
 ## Status LEDs
 
 `LED_COUNT` WS2812Bs joined end to end into a **ring**, with one animation per
@@ -512,16 +618,23 @@ and precharge timeouts.
   *implicitly* whenever none of positions 2/3/4 read active, so an unwired
   position 1 works as a deliberate "off" position. Assign a real pin if you ever
   want to distinguish "parked at 1" from a wiring fault.
-- Debounce is implemented per switch input at `SWITCH_DEBOUNCE_MS` (500 ms) -
-  a raw reading must be stable that long before it is acted on. Tune to taste;
-  too long feels laggy, too short defeats the purpose. The timer input is
-  **not** debounced yet.
-- `PIN_TIMER_IN` now has an explicit `INPUT_PULLDOWN` so it can never float
-  into `compressorRequested`, but the active level is still unconfirmed. With the
-  pull-down an unwired timer reads inactive, which blocks chiller demand - so if
-  that timer is not actually wired, the compressor will never run.
-- Confirm whether the timer input should gate/AND with the switch mode for
-  compressor demand, or be removed/repurposed now that the switch exists.
+- Debounce is implemented per input at `SWITCH_DEBOUNCE_MS` (500 ms) - a raw
+  reading must be stable that long before it is acted on. Tune to taste; too long
+  feels laggy, too short defeats the purpose. This now covers the system enable
+  contact as well, since it is a mechanical contact that will bounce exactly as
+  the switch does.
+- The system enable polarity is **active low with an internal pull-up**, per the
+  mechanical timer's normally-open enable contact. This is worth confirming on the
+  bench: if your timer closes the contact to +5V rather than pulling to GND, the
+  polarity has to be inverted in `readSystemEnableActive()` and the `pinMode()` in
+  `setup()` together. Until it is confirmed, nothing runs in any mode when the
+  contact is open - which is safe, but means a wrong polarity looks identical to
+  "the timer isn't wired up".
+- `SYSTEM_ENABLE_HOLD_MS` (2 minutes) is a placeholder. Tune it to how long your
+  users realistically take to notice the timer has run out and wind it back up.
+- `BUZZER_POSITION_CLICK_MS` (40ms) and `BUZZER_MODE_START_MS` (500ms) are
+  placeholders - check both are actually audible on the real buzzer element, and
+  that 40ms is not so short it clicks indistinctly or so long it lags the switch.
 - `LED_COUNT` is set to 10 for the ring, but the physical LED count has not been
   confirmed against the hardware - check it and adjust the one `#define`.
 - The ring no longer shows a latched fault. If that is wanted back, overlay it in
@@ -539,4 +652,5 @@ and precharge timeouts.
 - The dial needle is repositioned via the SVG `transform` attribute, so it snaps
   rather than animating between positions. Cosmetic only. The selected position is
   marked by an arrow plus an enlarged number.
-- Live status page could add a timer input row and mode override.
+- Live status page could add a mode override and a system-enable indicator you can
+  read at a glance from across the room.

@@ -334,6 +334,22 @@ function refresh() {
     setInput('vcur', d.pumpStallLimitVolts, 'c');
     setInput('bhz', d.buzzerHz, 'hz');
     html += row('Mode', modeSpan(d.mode));
+    // System enable is the master gate, so it sits directly under the mode: it
+    // is the single answer to "is anything allowed to run right now".
+    if (d.systemEnable) {
+      html += row('System enable', '<span class="ok">ENABLED</span> ' +
+                  '<span class="gpio">mechanical timer running, contact closed</span>',
+                  p.systemEnable);
+    } else if (d.systemEnableHold) {
+      html += row('System enable', '<span class="bad">TIMER STOPPED</span> &middot; restart window ' +
+                  fmtMs(d.systemEnableHoldRemainingMs) + ' left &middot; ' +
+                  '<span class="gpio">move the mode switch to re-arm</span>',
+                  p.systemEnable);
+    } else {
+      html += row('System enable', '<span class="bad">DISABLED</span> ' +
+                  '<span class="gpio">nothing can start in any mode until the ' +
+                  'mechanical timer closes its contact</span>', p.systemEnable);
+    }
     if (d.modeChangeRemainingMs > 0) {
       html += row('Pending mode', modeSpan(d.selectedMode) + ' in ' +
                   fmtMs(d.modeChangeRemainingMs) +
