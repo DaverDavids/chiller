@@ -15,7 +15,7 @@ status and manual function testing.
 | 2    | ADC - 12V current sense (input)        | n/a |
 | 3    | Switch position 3 - chiller only, active low | n/a |
 | 4    | System enable (external mechanical timer) | n/a |
-| 5    | Fan output                            | LOW |
+| 5    | Condenser fan - follows compressor     | LOW |
 | 6    | Buzzer output                         | LOW |
 | 7    | 12V enable output (PUMP ONLY)          | LOW |
 | 8    | Compressor output                     | LOW |
@@ -469,6 +469,30 @@ it just burns wall-clock time while the pump stays cut.
 
 Because the enable pin is pump-only, **a pump stall leaves a running chiller
 completely unaffected**. That is the whole point of separating the two.
+
+### The fan follows the compressor contacts
+
+`updateFanOutput()` is the single runtime writer of `PIN_FAN`, called once per
+loop immediately after `updateCompressorInterlock()`:
+
+```
+fan = compressorRunning || (manualTestOn && manualFanOn)
+```
+
+The fan is **not** mode-driven and **not** 12V-enable-driven. It follows the
+contacts, because a refrigeration compressor running without condenser airflow
+will overheat and fail. The interlock settles `compressorRunning` first and the
+fan is written from that same value in the next statement, so there is no window
+in which the contacts are closed and the fan is still off.
+
+A manual fan test can turn the fan **on** with the compressor stopped, which is
+useful on the bench. It cannot turn the fan **off** while the compressor is
+running: `testFanOverride` is ORed *under* `compressorRunning`, not over it, so
+the override cannot create the very hazard the interlock exists to prevent.
+`/test/fan?state=auto` hands the fan back to the compressor.
+
+This also makes the fan floor meaningful for the first time - it can only confirm
+the fan is *drawing* if something is actually commanding it on.
 
 ### Fan floor: present but inert
 

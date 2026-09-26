@@ -337,6 +337,14 @@ const int CAP_THRESHOLD_MIN_GAP = 200; // ~0.16V at ratio 1.0
 // CAP_CHARGED_ADC_MIN before the fault latches and the contacts stay open.
 const unsigned long PRECHARGE_TIMEOUT_MS = 30000; // TODO: tune to taste
 
+// How long the capacitor has to reach CAP_DISCHARGED_ADC_MAX after the charge
+// output is released, before it is declared incapable of discharging. Generous:
+// a working bleed path does it in a fraction of a second. This exists because
+// the alternative is not a slow start, it is a compressor that can never start
+// again and never says so - the interlock would sit in WAIT_DISCHARGE for ever
+// with the capacitor sitting charged on the pin.
+const unsigned long CAP_DISCHARGE_TIMEOUT_MS = 10000;
+
 // Once the fault has latched, the chiller demand must be removed for this long
 // before it clears, so a bad capacitor or charge path can't be re-energized by
 // simply bouncing the switch.
@@ -475,6 +483,9 @@ CapSeq capSeq = CAP_SEQ_WAIT_DISCHARGE;
 
 bool compressorRunning = false;  // true only while the compressor output is HIGH
 bool compressorFault = false;    // latched precharge timeout; blocks all starts
+// Why the latch is set, so the web UI can say what actually went wrong instead
+// of a bare "FAULT". Cleared when the latch clears.
+const char *faultReason = "";
 bool faultResetArmed = false;    // demand-removal hold for clearing the fault
 unsigned long faultResetStart = 0;
 unsigned long capChargeStart = 0; // when the charge output was asserted
@@ -615,6 +626,7 @@ void saveThresholds();
 void saveBuzzerFrequency();
 void saveSettings(const String &ssid, const String &pass);
 void updateBuzzerOutput();
+void updateFanOutput();
 const char* stateName();
 const char* modeName();
 const char* selectedModeName();
@@ -725,8 +737,12 @@ void loop() {
   // the compressor runs off its own interlocked contacts.
   update12VEnable(pumpRequested);
 
-  // ---- manual test outputs for fan/buzzer (non-safety-critical) ----
-  digitalWrite(PIN_FAN, (testFanOverrideActive ? testFanOverride : false) ? HIGH : LOW);
+  // ---- condenser fan: follows the compressor contacts ----
+  // Immediately after the interlock, so the fan is commanded from the same
+  // compressorRunning flag the interlock has just settled this loop.
+  updateFanOutput();
+
+  // ---- manual test output for the buzzer (non-safety-critical) ----
   updateBuzzerOutput();
 
   // ---- status LEDs ----
@@ -868,172 +884,225 @@ bool isFanDrawingCurrent() {
 void updateCompressorInterlock(bool wantCompressor) {
   int cap = readCapacitorADC();
 
-  // Discharge timing runs every loop, faulted or not, so the web UI keeps
-  // showing a live reading. Restarts each time the cap rises back to charged.
-  if (cap < CAP_CHARGED_ADC_MIN) {
-    if (!capDischargeTiming) {
-      capDischargeTiming = true;
-      capDischargeStart = millis();
-    }
-  } else if (capDischargeTiming) {
-    capDischargeTiming = false;
-    lastCapDischargeMs = millis() - capDischargeStart;
-  }
+  // =========================================================================
+  // THE ONLY TWO DECISIONS IN THIS FUNCTION
+  // =========================================================================
+  // Every path below sets these two booleans and touches no pin directly. The
+  // outputs are written ONCE, unconditionally, at the bottom of this function,
+  // from these two values. That is what makes the invariant infallible rather
+  // than merely intended: there is a single write site that always runs, so no
+  // branch, no early return, and no future edit can leave a pin stale. The
+  // previous version called digitalWrite() from inside a dozen branches,
+  // including an early return on the fault path, so "charge pin off whenever
+  // the compressor is not running" was a rule each branch had to remember.
+  //
+  //   closeContacts -> compressor output. True only when the capacitor has
+  //                    been proven charged.
+  //   chargeCap     -> capacitor charge output. True only while the capacitor
+  //                    is wanted charged: precharging, or running.
+  //
+  // The invariant: the capacitor is charged exactly while the compressor is
+  // running or being precharged, and is released to discharge at every other
+  // moment - idle, off, demand withheld, stop pending, latched fault, all of it.
+  bool closeContacts = false;
+  bool chargeCap     = false;
 
-  // Latched fault: everything off, and no charging, until the state machine
-  // clears it after the reset hold.
   if (compressorFault) {
-    digitalWrite(PIN_COMPRESSOR, LOW);
-    digitalWrite(PIN_CAP_CHARGE, LOW);
-    compressorRunning = false;
-    compressorStopRequestedAt = 0;
+    // Latched fault. Both booleans stay false, so both outputs go to their
+    // released state regardless of demand, until runStateMachine() clears it.
     capSeq = CAP_SEQ_WAIT_DISCHARGE;
+    compressorStopRequestedAt = 0;
     fanStalled = false;
-    return;
-  }
-
-  switch (capSeq) {
-    case CAP_SEQ_WAIT_DISCHARGE:
-      // Contacts open, and the charge output is parked LOW here UNCONDITIONALLY
-      // - before the arm test below, not inside it. That ordering is the point:
-      // a run may be requested while the capacitor is still charged, and the
-      // charge output must be off in that case so the capacitor is free to bleed
-      // down to CAP_DISCHARGED_ADC_MAX. If charging were left on here it would
-      // hold the capacitor at the charged voltage forever, the arm test would
-      // never be satisfied, and the compressor would never run again.
-      digitalWrite(PIN_COMPRESSOR, LOW);
-      digitalWrite(PIN_CAP_CHARGE, LOW);
-      compressorRunning = false;
-      compressorStopRequestedAt = 0;
-      // Re-arm only once the capacitor is actually seen discharged AND the
-      // compressor is being requested. Merely requesting a run is not enough.
-      if (wantCompressor && (cap <= CAP_DISCHARGED_ADC_MAX)) {
-        capSeq = CAP_SEQ_CHARGING;
-        capChargeStart = millis();
-      }
-      break;
-
-    case CAP_SEQ_CHARGING:
-      // Contacts stay open for the whole charge, no matter how long it takes.
-      digitalWrite(PIN_COMPRESSOR, LOW);
-      compressorRunning = false;
-
-      if (!wantCompressor) {
-        // Demand went away mid-charge. Stop charging now rather than leaving
-        // the charge output HIGH until the next loop, so the pin state is
-        // deterministic within this same iteration.
-        digitalWrite(PIN_CAP_CHARGE, LOW);
-        capSeq = CAP_SEQ_WAIT_DISCHARGE;
+  } else {
+    switch (capSeq) {
+      case CAP_SEQ_WAIT_DISCHARGE:
+        // Re-arm only once the capacitor has actually been SEEN discharged AND
+        // the compressor is being requested. Merely requesting a run is not
+        // enough - this single test is what stops the contacts closing on a
+        // charged capacitor, so it is never bypassed, moved or reordered.
+        if (wantCompressor && (cap <= CAP_DISCHARGED_ADC_MAX)) {
+          capSeq = CAP_SEQ_CHARGING;
+          capChargeStart = millis();
+        }
         break;
-      }
 
-      // Bound the entire charging phase, not just the "not charged yet" part, so
-      // the charge output can never be left energized indefinitely if the
-      // capacitor will not charge. Latch a fault instead of sitting here.
-      //
-      // With the 12V current sense removed as a start precondition (it measures
-      // the RAIL - fan plus pump - and says nothing about the compressor's
-      // capacitor), failing to charge is the only reason the contacts stay open
-      // here, so this is now purely a "capacitor or charge path is dead" trip.
-      //
-      // Checked BEFORE the charge output is set HIGH, and parked LOW on the
-      // trip, so the pin state is deterministic within this same iteration
-      // rather than waiting for the next loop to clear it - the same invariant
-      // the demand-lost branch above relies on. The charge output is never
-      // energized on the iteration that gives up.
-      if (millis() - capChargeStart >= PRECHARGE_TIMEOUT_MS) {
-        digitalWrite(PIN_CAP_CHARGE, LOW);
-        capSeq = CAP_SEQ_WAIT_DISCHARGE;
-        compressorFault = true;
-        DBG_PRINTF("[FAULT] capacitor did not charge in %lums: cap=%d (need >=%d)\n",
-                   (unsigned long)PRECHARGE_TIMEOUT_MS, cap, CAP_CHARGED_ADC_MIN);
+      case CAP_SEQ_CHARGING:
+        // Contacts stay open for the whole charge, no matter how long it takes.
+        if (!wantCompressor) {
+          // Demand went away mid-charge. Release the capacitor immediately
+          // rather than leaving the charge output high until the next loop.
+          capSeq = CAP_SEQ_WAIT_DISCHARGE;
+          break;
+        }
+
+        // Bound the entire charging phase, not just the "not charged yet" part,
+        // so the charge output can never be left energised indefinitely if the
+        // capacitor will not charge. Latch a fault instead of sitting here.
+        //
+        // Checked BEFORE chargeCap is set, so the charge output is never
+        // energised on the iteration that gives up.
+        if (millis() - capChargeStart >= PRECHARGE_TIMEOUT_MS) {
+          capSeq = CAP_SEQ_WAIT_DISCHARGE;
+          compressorFault = true;
+          faultReason = "capacitor did not charge";
+          DBG_PRINTF("[FAULT] capacitor did not charge in %lums: cap=%d (need >=%d)\n",
+                     (unsigned long)PRECHARGE_TIMEOUT_MS, cap, CAP_CHARGED_ADC_MIN);
+          break;
+        }
+
+        chargeCap = true;
+
+        // Capacitor proven charged - the ONLY condition for closing the
+        // contacts. The 12V rail current is deliberately not consulted: the
+        // rail belongs to the fan and the pump, and a pump fault is handled by
+        // update12VEnable(), which cuts the pump. Gating the compressor on it
+        // would mean a stalled pump could stop the chiller, and a healthy quiet
+        // rail could stop it too.
+        if (cap >= CAP_CHARGED_ADC_MIN) {
+          capSeq = CAP_SEQ_RUNNING;
+          compressorRunStart = millis();
+          closeContacts = true;
+        }
         break;
-      }
 
-      digitalWrite(PIN_CAP_CHARGE, HIGH);
+      case CAP_SEQ_RUNNING: {
+        // The compressor's only safety trip is its own minimum run time, checked
+        // below. There is deliberately NO 12V overcurrent trip here: the current
+        // sense measures the rail, which is the fan and the pump, so an
+        // overcurrent is a pump fault and belongs to update12VEnable(), which
+        // cuts the pump and leaves the chiller running.
+        //
+        // What replaced it is a report-only fan check. A seized fan on a
+        // running compressor will overheat it, so the floor is sampled every
+        // loop while the contacts are closed - but FAN_RUN_ADC_MIN is 0, which
+        // no reading can fall below, so this cannot fire until the floor has
+        // been measured against a real fan.
+        fanStalled = !isFanDrawingCurrent();
 
-      // Capacitor proven charged - the ONLY condition for closing the contacts.
-      // The 12V rail current is deliberately not consulted: the rail belongs to
-      // the fan and the pump, and a pump fault is handled by update12VEnable(),
-      // which cuts the pump. Gating the compressor on it would mean a stalled
-      // pump could stop the chiller, and a healthy quiet rail could stop it too.
-      if (cap >= CAP_CHARGED_ADC_MIN) {
-        digitalWrite(PIN_COMPRESSOR, HIGH);
-        compressorRunning = true;
-        compressorRunStart = millis();
-        capSeq = CAP_SEQ_RUNNING;
-      }
-      break;
+        // Demand still present: stay closed. This must be checked before the
+        // stop-hold logic below - previously, wantCompressor==true zeroed
+        // compressorStopRequestedAt and then fell through into the "normal
+        // stop" code every single loop, so the compressor could never stay
+        // running for more than one iteration. Clear the stop-pending marker
+        // and keep the capacitor topped up for the life of the run.
+        if (wantCompressor) {
+          compressorStopRequestedAt = 0;
+          chargeCap = true;
+          closeContacts = true;
+          break;
+        }
 
-    case CAP_SEQ_RUNNING: {
-      // The compressor's only safety trip is its own minimum run time, checked
-      // below. There is deliberately NO 12V overcurrent trip here any more: the
-      // current sense measures the rail, which is the fan and the pump, so an
-      // overcurrent is a pump fault and belongs to update12VEnable(), which cuts
-      // the pump and leaves the chiller running. A pump jam no longer stops the
-      // chiller.
-      //
-      // What replaced it is a report-only fan check. A seized fan on a running
-      // compressor will overheat it, so the floor is sampled every loop while
-      // the contacts are closed - but FAN_RUN_ADC_MIN is 0, which no reading can
-      // fall below, so this cannot fire until the floor has been measured
-      // against a real fan. It sets a flag for the web UI and does NOT open the
-      // contacts, because a spurious trip on an uncalibrated floor would stop a
-      // healthy chiller.
-      fanStalled = !isFanDrawingCurrent();
+        // Demand has been removed. Stamp when the stop was first requested (if
+        // not already stamped), so an OFF-then-ON inside the off-delay window
+        // can clear this and resume the same run instead of opening the
+        // contacts and starting over.
+        if (compressorStopRequestedAt == 0) {
+          compressorStopRequestedAt = millis();
+        }
 
-      // Demand still present: stay closed. This must be checked before the
-      // stop-hold logic below - previously, wantCompressor==true zeroed
-      // compressorStopRequestedAt and then fell through into the "normal
-      // stop" code every single loop, so the compressor could never stay
-      // running for more than one iteration. Clear the stop-pending marker
-      // and keep the capacitor topped up for the life of the run.
-      if (wantCompressor) {
+        bool minRunElapsed  = (millis() - compressorRunStart) >= COMPRESSOR_MIN_RUN_MS;
+        bool offDelayElapsed = (millis() - compressorStopRequestedAt) >= COMPRESSOR_OFF_DELAY_MS;
+
+        if (!(minRunElapsed && offDelayElapsed)) {
+          // Either the minimum run time hasn't been met yet, or the off-delay
+          // is still running. Stay closed and keep the capacitor charged, so a
+          // brief demand dip or an OFF-then-ON can't short-cycle the compressor.
+          chargeCap = true;
+          closeContacts = true;
+          break;
+        }
+
+        // Both holds satisfied - normal stop. Contacts open, capacitor released,
+        // and the next start must re-arm from a discharged capacitor.
+        capSeq = CAP_SEQ_WAIT_DISCHARGE;
         compressorStopRequestedAt = 0;
-        digitalWrite(PIN_CAP_CHARGE, HIGH);
-        digitalWrite(PIN_COMPRESSOR, HIGH);
-        compressorRunning = true;
+        DBG_PRINTLN("[COMPRESSOR] min run + off delay elapsed, contacts opened");
         break;
       }
-
-      // Demand has been removed. Stamp when the stop was first requested (if
-      // not already stamped), so an OFF-then-ON inside the off-delay window
-      // can clear this and resume the same run instead of opening the
-      // contacts and starting over.
-      if (compressorStopRequestedAt == 0) {
-        compressorStopRequestedAt = millis();
-      }
-
-      bool minRunElapsed  = (millis() - compressorRunStart) >= COMPRESSOR_MIN_RUN_MS;
-      bool offDelayElapsed = (millis() - compressorStopRequestedAt) >= COMPRESSOR_OFF_DELAY_MS;
-
-      if (!(minRunElapsed && offDelayElapsed)) {
-        // Either the minimum run time hasn't been met yet, or the off-delay is
-        // still running. Stay closed and keep the capacitor charged, so a brief
-        // demand dip or an OFF-then-ON can't short-cycle the compressor.
-        digitalWrite(PIN_CAP_CHARGE, HIGH);
-        digitalWrite(PIN_COMPRESSOR, HIGH);
-        compressorRunning = true;
-        break;
-      }
-
-      // Both holds satisfied - normal stop. Contacts open, charging stops, and
-      // the next start must re-arm from a discharged capacitor.
-      digitalWrite(PIN_COMPRESSOR, LOW);
-      digitalWrite(PIN_CAP_CHARGE, LOW);
-      compressorRunning = false;
-      compressorStopRequestedAt = 0;
-      capSeq = CAP_SEQ_WAIT_DISCHARGE;
-      DBG_PRINTLN("[COMPRESSOR] min run + off delay elapsed, contacts opened");
-      break;
     }
   }
+
+  // =========================================================================
+  // DISCHARGE TIMING AND WATCHDOG
+  // =========================================================================
+  // One timer serves both the UI readout and the fault, and it completes only
+  // when the capacitor is actually SEEN at or below the discharged threshold.
+  //
+  // The previous version timed charged -> below-CHARGED-threshold -> charged
+  // again, which measures a noise dip rather than a discharge. It could report
+  // "last took 0.1s" for a single glitch while the capacitor was in fact sitting
+  // charged on the pin, and it could report "not discharging" while the
+  // capacitor was mid-discharge. It cannot answer the only question that
+  // matters here: did the capacitor actually bleed down?
+  if (!compressorFault) {
+    if (!chargeCap && (cap > CAP_DISCHARGED_ADC_MAX)) {
+      if (!capDischargeTiming) {
+        capDischargeTiming = true;
+        capDischargeStart = millis();
+      } else if (millis() - capDischargeStart >= CAP_DISCHARGE_TIMEOUT_MS) {
+        // Released, given CAP_DISCHARGE_TIMEOUT_MS, and still above the
+        // threshold. Latch a clearable fault rather than sitting in
+        // WAIT_DISCHARGE for ever, which would leave the compressor unable to
+        // start again with nothing to indicate why.
+        compressorFault = true;
+        faultReason = "capacitor will not discharge";
+        capDischargeTiming = false; // so a cleared latch re-times cleanly
+        DBG_PRINTF("[FAULT] capacitor still at %d counts (need <=%d) %lums after the charge output was released\n",
+                   cap, CAP_DISCHARGED_ADC_MAX, (unsigned long)CAP_DISCHARGE_TIMEOUT_MS);
+      }
+    } else if (capDischargeTiming && (cap <= CAP_DISCHARGED_ADC_MAX)) {
+      capDischargeTiming = false;
+      lastCapDischargeMs = millis() - capDischargeStart;
+    } else if (chargeCap) {
+      capDischargeTiming = false; // charging, so by definition not discharging
+    }
+  }
+  // While the latch is set the timer is left frozen, so the latch can be cleared
+  // by runStateMachine() instead of being instantly re-latched here.
+
+  // =========================================================================
+  // SINGLE UNCONDITIONAL WRITE
+  // =========================================================================
+  // Contacts first, then the charge output, from the same two booleans that
+  // every path above had to set. A charged capacitor is therefore only ever
+  // possible alongside a closed contact, and a released capacitor is possible
+  // on every other path by construction rather than by remembering.
+  digitalWrite(PIN_COMPRESSOR, closeContacts ? HIGH : LOW);
+  digitalWrite(PIN_CAP_CHARGE,  chargeCap     ? HIGH : LOW);
+  compressorRunning = closeContacts;
 
   // The fan floor is only meaningful while the contacts are closed, so clear it
   // on every other path rather than letting a stale true from the last run sit
-  // on the web UI with the compressor stopped. Done here as well as in the
-  // latched-fault early return above, so there is one rule and one place.
+  // on the web UI with the compressor stopped.
   if (capSeq != CAP_SEQ_RUNNING) fanStalled = false;
+}
+
+// =========================================================================
+// CONDENSER FAN - commanded ON whenever the compressor contacts are closed
+// =========================================================================
+// The fan is neither a convenience output nor a mode-driven one. A refrigeration
+// compressor running without condenser airflow will overheat and fail, so the fan
+// follows the CONTACTS - not the mode, not the demand, and not the 12V enable.
+// Whenever the interlock has the compressor output closed, the fan is on.
+//
+// Single runtime writer of PIN_FAN, called once per loop immediately after
+// updateCompressorInterlock(). The ordering is deliberate: the interlock settles
+// compressorRunning first, and the fan is then commanded from that same settled
+// value, so there is no window in which the contacts are closed and the fan is
+// still off. Both outputs are written from the same flag in adjacent statements.
+//
+// A manual fan test may turn the fan ON with the compressor stopped, which is
+// useful on the bench, but it CANNOT turn the fan OFF while the compressor is
+// running. testFanOverride is ORed UNDER compressorRunning rather than over it,
+// so the override cannot create the exact hazard the interlock exists to prevent.
+// "auto" hands the fan back to the compressor.
+//
+// Note the fan stall check (isFanDrawingCurrent) is only meaningful once this has
+// been commanding the fan: it confirms current is actually being drawn, which
+// proves the fan is spinning rather than just being told to.
+void updateFanOutput() {
+  bool commanded = compressorRunning || (testFanOverrideActive && testFanOverride);
+  digitalWrite(PIN_FAN, commanded ? HIGH : LOW);
 }
 
 // =========================================================================
@@ -1596,6 +1665,7 @@ void runStateMachine() {
       } else if (millis() - faultResetStart >= FAULT_RESET_HOLD_MS) {
         compressorFault = false;
         faultResetArmed = false;
+        faultReason = "";
         DBG_PRINTLN("[FAULT] cleared, interlock reset to WAIT_DISCHARGE");
       }
     }
@@ -1898,6 +1968,7 @@ void handleStatusJson() {
   json += "\"enable12vHold\":" + String(pumpOffTimerActive ? "true" : "false") + ",";
   json += "\"compressor\":" + String(digitalRead(PIN_COMPRESSOR) == HIGH ? "true" : "false") + ",";
   json += "\"fault\":" + String(compressorFault ? "true" : "false") + ",";
+  json += "\"faultReason\":\"" + String(faultReason) + "\",";
   json += "\"switch1\":" + String(switch1State ? "true" : "false") + ",";
   json += "\"switch2\":" + String(switch2State ? "true" : "false") + ",";
   json += "\"switch3\":" + String(switch3State ? "true" : "false") + ",";

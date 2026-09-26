@@ -161,6 +161,13 @@ const char PAGE_STATUS[] PROGMEM = R"====(
 <button onclick="testCall('/test/fan?state=on')">On</button>
 <button onclick="testCall('/test/fan?state=off')">Off</button>
 <button onclick="testCall('/test/fan?state=auto')">Auto</button>
+<div style="color:#888;font-size:11px;margin-top:6px">
+  Auto = follow the compressor. The fan runs automatically whenever the
+  compressor contacts are closed, so this only needs On to test it with the
+  compressor stopped. <b>Off cannot switch the fan off while the compressor is
+  running</b> - the compressor wins, because a compressor with no condenser
+  airflow will overheat.
+</div>
 
 <h3>Buzzer test</h3>
 <div>
@@ -506,12 +513,27 @@ function refresh() {
                   fmtMs(d.pumpStallRetryRemainingMs) +
                   ' <span class="gpio">chiller unaffected</span>', p.currentSense);
     }
-    if (d.fanStalled) {
-      html += row('Fan', '<span class="bad">NOT DRAWING</span> &middot; sensor or seized fan, report only',
-                  p.fan);
+    // One row for the fan, stating WHY it is on, so "off" is visibly wrong the
+    // moment the compressor is running rather than looking like a normal state.
+    let fanText = boolCell(d.fan);
+    if (d.compressor) {
+      fanText += ' <span class="gpio">following compressor contacts</span>';
+    } else if (d.testFanActive) {
+      fanText += ' <span class="gpio">manual test</span>';
+    } else {
+      fanText += ' <span class="gpio">auto, compressor stopped</span>';
     }
-    html += row('Fault', d.fault ? '<span class="bad">LATCHED</span>' : '<span>none</span>');
-    html += row('Fan', boolCell(d.fan) + (d.testFanActive ? ' (manual)' : ''), p.fan);
+    if (d.fanStalled) {
+      fanText += ' <span class="bad">NOT DRAWING</span>' +
+                 ' <span class="gpio">seized fan or sensor fault, report only</span>';
+    }
+    html += row('Condenser fan', fanText, p.fan);
+    html += row('Fault', d.fault
+      ? '<span class="bad">LATCHED</span> &middot; ' +
+        (d.faultReason || 'unknown') +
+        ' <span class="gpio">turn the switch to off and leave it ' +
+        Math.round(d.faultResetHoldMs / 1000) + 's to clear</span>'
+      : '<span>none</span>');
     html += row('Buzzer', boolCell(d.buzzerToneActive) + ' &middot; pulsed at ' + d.buzzerHz + ' Hz' +
                 (d.testBuzzerActive ? ' (manual)' : ''), p.buzzer);
     html += row('12V enable (pump)', boolCell(d.enable12v) + (d.enable12vHold ? ' (hold-off delay active)' : ''), p.enable12v);
