@@ -25,10 +25,22 @@
     Switch inputs are ACTIVE LOW: a position is "active" when its pin is
     pulled to GND by the switch, otherwise the internal pull-up holds it
     HIGH.
-    Position 1 (not wired) -> everything off
+    Position 1 (not wired) -> everything off. It is selected implicitly:
+      whenever none of positions 2/3/4 are active, the switch is in position 1.
     Position 2 -> pump only (12V enable), compressor never requested
     Position 3 -> chiller only (compressor path)
     Position 4 -> pump AND chiller both requested simultaneously
+    A newly selected position is NOT acted on straight away - the previous
+    position keeps running for MODE_SWITCH_DELAY_MS first, so the outputs as
+    well as the LEDs wait it out. See updateModeSelection().
+
+  STATUS LED RING:
+    LED_COUNT WS2812Bs joined into a circle, one animation per mode: blue
+    twinkling back and forth for chiller only, a red chase going round the ring
+    for pump only, both at once for both, black for off. The ring wipes the new
+    mode's animation in from LED 0 during the same MODE_SWITCH_DELAY_MS the
+    mode itself is held for, so the circle is fully lit at the instant the mode
+    takes effect. See updateStatusLeds() and the tunables block by LED_COUNT.
 
   CAPACITOR INTERLOCK (the compressor start path):
     The capacitor is charged by holding the charge output (GPIO1) HIGH, and
@@ -123,19 +135,66 @@ bool wifiReconnectRequested = false;
 // Mode-select switch inputs (one-of-four rotary/slide switch), active low.
 #define PIN_SWITCH_1   -1  // position 1 - OFF. NOT WIRED: no pin assigned yet.
                           // Any negative value reads permanently inactive, so
-                          // position 1 can never be selected until a real pin
-                          // is set here. MODE_OFF is still reachable through
-                          // the fail-safe path in getSwitchMode().
+                          // the pin itself can never select anything. Position 1
+                          // does not need it: getSwitchMode() picks OFF whenever
+                          // none of the wired positions are active, so parking
+                          // the switch here still turns everything off.
 #define PIN_SWITCH_2   20  // position 2 - pump only
 #define PIN_SWITCH_3   3   // position 3 - chiller only
 #define PIN_SWITCH_4   10  // position 4 - pump + chiller
 
-// Addressable status LEDs. GPIO21 was the hardware UART0 TX pin on most
-// supermini boards - using it for LED data means Serial debug has to run over
-// the native USB port (GPIO18/19) instead. TODO: confirm LED_COUNT.
+// Addressable status LEDs, wired as a RING - LED_COUNT WS2812Bs joined end to
+// end into a circle. Every animation below is written to close on itself:
+// whole numbers of wave crests only, and the chase tail wraps behind the head.
+// GPIO21 was the hardware UART0 TX pin on most supermini boards - using it for
+// LED data means Serial debug has to run over the native USB port (GPIO18/19)
+// instead.
 #define LED_DATA_PIN   21
-#define LED_COUNT      8   // PLACEHOLDER - set to actual strip length
+#define LED_COUNT      10  // number of LEDs in the circle
 Adafruit_NeoPixel statusLeds(LED_COUNT, LED_DATA_PIN, NEO_GRB + NEO_KHZ800);
+
+// ===================== LED RING ANIMATION TUNABLES =======================
+// Every knob that decides how the ring LOOKS is in this one block, so the
+// pattern can be dialled in on the bench without reading the renderer.
+//
+// The reveal window is deliberately NOT here: it is derived from
+// MODE_SWITCH_DELAY_MS (see updateStatusLeds) so the wipe-in and the mode
+// change physically cannot drift apart.
+
+// How often the ring is redrawn. Every redraw ends in the blocking
+// statusLeds.show(), so it is never run for nothing.
+const unsigned long LED_FRAME_INTERVAL_MS = 30; // ~33fps
+
+// ---- chiller pattern: blue light twinkling back and forth ----
+// How many bright crests the wave carries around the ring. MUST be a whole
+// number or the wave will not join up where the ring closes.
+const uint8_t LED_TWINKLE_CREST_COUNT = 2;
+// Time for one there-and-back sweep of the crests. Smaller is faster.
+const unsigned long LED_TWINKLE_SWEEP_MS = 2600;
+// +1 or -1: which way round the ring the crests drift before turning back.
+const int LED_TWINKLE_DIRECTION = 1;
+// Brightness of a crest, and of the trough between crests. 0-255.
+const uint8_t LED_TWINKLE_BRIGHT = 120;
+const uint8_t LED_TWINKLE_DIM    = 25;
+
+// ---- pump pattern: a red chase slowly going round the ring ----
+// Time between chase steps. One full lap is this multiplied by LED_COUNT.
+const unsigned long LED_CHASE_STEP_MS = 260;
+// Brightness of the head of the chase, 0-255. Everything further back than the
+// tail below is black.
+const uint8_t LED_CHASE_HEAD = 200;
+// Brightness 1, 2, 3 ... LEDs behind the head. Add or remove entries to change
+// how far the tail reaches.
+const uint8_t LED_CHASE_TAIL[] = {110, 55, 20};
+
+// ---- colour ramps: each pattern fades between its own dim and bright shade ----
+// The twinkle runs through blueish shades, deep blue up to pale blue.
+const uint8_t LED_CHILLER_DIM_COLOR[3]    = {  5,  15,  80};
+const uint8_t LED_CHILLER_BRIGHT_COLOR[3] = { 80, 160, 255};
+// The chase runs from black up into red, so the tail fades away instead of
+// stopping dead.
+const uint8_t LED_PUMP_DIM_COLOR[3]    = {  0,   0,   0};
+const uint8_t LED_PUMP_BRIGHT_COLOR[3] = {255,  45,  25};
 
 // ==================== SAFETY THRESHOLDS (PSEUDO/TODO) ====================
 // Capacitor charge interlock, read on PIN_CAP_SENSE. Two separate thresholds
@@ -239,6 +298,21 @@ const unsigned long SWITCH_DEBOUNCE_MS = 500; // TODO: tune to taste
 // demand drops, so switching modes doesn't stop/restart the pump every time.
 const unsigned long PUMP_OFF_DELAY_MS = 1000; // TODO: tune to taste
 
+// Mode change delay. A newly selected switch position is NOT acted on the
+// moment it is read: the mode actually in effect keeps running the PREVIOUS
+// position for this long first. See updateModeSelection().
+//
+// This gates the hardware, not just the LEDs. The pump and compressor demand
+// flags are derived from the mode in effect, so both outputs wait the window
+// out as well - a switch nudged into a new position and back cannot reach the
+// pump or the compressor, and there is no way to skip a delay by re-reading the
+// switch.
+//
+// The LED ring spends exactly this same window wiping the NEW mode's animation
+// in from LED 0 upwards, so the last LED lights on the same tick the mode takes
+// effect and the animation is never caught half-revealed.
+const unsigned long MODE_SWITCH_DELAY_MS = 3000;
+
 // Buzzer test tone frequency, in Hz. The buzzer is driven as a pulsed square
 // wave at this rate - it is never held at a static DC level, which would either
 // produce no sound (most piezo elements need AC) or overheat the element.
@@ -253,7 +327,18 @@ enum ChillerMode {
   MODE_CHILLER_ONLY,
   MODE_BOTH
 };
-ChillerMode currentMode = MODE_OFF;
+// The debounced switch reading, and the mode actually in effect. They are the
+// same value except during the MODE_SWITCH_DELAY_MS hold after a change:
+// selectedMode is what the operator asked for, currentMode is what is running.
+// updateModeSelection() is the only writer of any of them, so the delay cannot
+// be bypassed by reading currentMode instead.
+ChillerMode selectedMode = MODE_OFF;
+ChillerMode currentMode   = MODE_OFF;
+// The mode the LED ring is wiping away from. Reset to currentMode every time
+// the selection changes, so a switch that bounces mid-hold still wipes out of
+// what was actually on the ring rather than out of a mode that never ran.
+ChillerMode outgoingMode  = MODE_OFF;
+unsigned long modeChangeStart = 0; // when selectedMode last changed
 
 enum ChillerState {
   STATE_IDLE,
@@ -346,8 +431,13 @@ bool readSwitchActive(int pin);
 void setupSwitchPin(int pin);
 void updateDebounced(DebouncedSwitch &d, bool raw);
 ChillerMode getSwitchMode();
+void updateModeSelection(ChillerMode selected);
 void applyMode();
 void updateStatusLeds();
+uint8_t twinkleLevel(uint8_t index, unsigned long now);
+uint8_t chaseLevel(uint8_t index, unsigned long now);
+int rampChannel(uint8_t dim, uint8_t bright, uint8_t level);
+uint8_t ledRevealCount();
 void serviceWifi();
 void startWifiAttempt();
 void startCaptivePortal();
@@ -372,6 +462,7 @@ void saveSettings(const String &ssid, const String &pass);
 void updateBuzzerOutput();
 const char* stateName();
 const char* modeName();
+const char* selectedModeName();
 const char* capSeqName();
 String pinLevel(int pin);
 
@@ -434,7 +525,10 @@ void setup() {
 void loop() {
   // ---- read inputs first ----
   readSwitchInputs();
-  currentMode = getSwitchMode();
+  // A newly selected position is held back for MODE_SWITCH_DELAY_MS before it
+  // becomes the mode in effect, so it gates the demand flags below as well as
+  // the LED ring.
+  updateModeSelection(getSwitchMode());
   applyMode(); // sets compressorRequested / pumpRequested from mode + overrides
 
   // ---- fault latch / display state, derived from the interlock ----
@@ -796,16 +890,44 @@ void readSwitchInputs() {
 }
 
 ChillerMode getSwitchMode() {
-  // Expected to be a one-of-four switch. If none or more than one read
-  // active (wiring fault, transition glitch, etc.) fail safe to OFF.
-  uint8_t activeCount = switch1State + switch2State + switch3State + switch4State;
-  if (activeCount != 1) {
-    return MODE_OFF;
-  }
+  // Position 1 is OFF and has no pin of its own (PIN_SWITCH_1 is -1), so it is
+  // selected implicitly: whenever none of the wired positions 2/3/4 read
+  // active, the switch is sitting in position 1. Its own input is ignored for
+  // selection either way, which is what makes an unwired position 1 usable.
+  //
+  // Anything else - more than one wired position active - is a wiring fault or a
+  // transition glitch. The debounce in readSwitchInputs() should have filtered
+  // the glitch already, but if one gets through it still fails safe to OFF
+  // rather than picking an arbitrary position and running the wrong hardware.
+  if (!switch2State && !switch3State && !switch4State) return MODE_OFF;
+  if (switch2State && switch3State) return MODE_OFF;
+  if (switch2State && switch4State) return MODE_OFF;
+  if (switch3State && switch4State) return MODE_OFF;
   if (switch2State) return MODE_PUMP_ONLY;
   if (switch3State) return MODE_CHILLER_ONLY;
-  if (switch4State) return MODE_BOTH;
-  return MODE_OFF; // switch1State, or fallback
+  return MODE_BOTH; // switch4State
+}
+
+// Sole owner of selectedMode, currentMode and outgoingMode, called every loop
+// before applyMode(). A change to the switch reading is stamped and then ignored
+// until the delay has run out, so the mode in effect cannot change without the
+// hold being served first. Runs before updateStatusLeds(), which relies on the
+// two modes agreeing on when the hold ends so the wipe and the switch land on
+// the same tick.
+void updateModeSelection(ChillerMode selected) {
+  if (selected != selectedMode) {
+    // Whatever is on the ring right now is what the wipe starts from. Taken
+    // from currentMode, not from the selection just abandoned, so a switch that
+    // bounces part way through a hold still wipes out of the mode that was
+    // actually running.
+    outgoingMode = currentMode;
+    selectedMode = selected;
+    modeChangeStart = millis();
+    return; // the hold starts now; the mode in effect does not move yet
+  }
+  if (currentMode == selectedMode) return;                  // already caught up
+  if (millis() - modeChangeStart < MODE_SWITCH_DELAY_MS) return; // still holding
+  currentMode = selectedMode;
 }
 
 void applyMode() {
@@ -831,37 +953,155 @@ void applyMode() {
 }
 
 // =========================================================================
-// STATUS LEDS - pseudo color mapping, adjust colors/patterns as desired
+// STATUS LEDS - one animation per mode, wiped in over the mode change delay.
+//
+// The ring is a circle, so the two patterns are written to close on themselves:
+// the twinkle carries a whole number of crests around the loop, and the chase
+// measures distance backwards so its tail wraps behind its head.
+//
+// CHILLER_ONLY  blueish shades twinkling back and forth around the ring
+// PUMP_ONLY     a red chase stepping slowly around the ring
+// BOTH          both of the above at once, mixed additively
+// OFF           black
+//
+// A mode change is not instantaneous. updateModeSelection() keeps the previous
+// mode running for MODE_SWITCH_DELAY_MS, and the ring spends exactly that same
+// window switching over from LED 0 upwards, showing the pattern of the mode
+// that is ABOUT to take effect. The last LED switches on the same tick the mode
+// becomes current, so the animation is never caught half-revealed.
+//
+// LEDs the wipe has not reached yet still show the mode being REPLACED, not
+// black. That is what makes the wipe work in both directions from one rule:
+// filling up from OFF reveals the new animation LED by LED, and going to OFF -
+// whose pattern is black - extinguishes the old animation LED by LED instead of
+// blanking the whole ring in a single step.
+//
+// This reads the mode state only; it drives no output pin and cannot reach the
+// pump or the compressor.
 // =========================================================================
-void updateStatusLeds() {
-  uint32_t color;
-  switch (state) {
-    case STATE_FAULT:
-      // slow flash red
-      color = ((millis() / 500) % 2 == 0) ? statusLeds.Color(255, 0, 0) : statusLeds.Color(0, 0, 0);
-      break;
-    case STATE_RUN:
-      color = pumpRequested ? statusLeds.Color(128, 0, 128)   // chiller + pump = purple
-                             : statusLeds.Color(255, 60, 0);  // chiller only = orange
-      break;
-    case STATE_PRECHARGE:
-      color = statusLeds.Color(255, 255, 0); // charging capacitor = yellow
-      break;
-    default: // STATE_IDLE
-      if (pumpRequested || pumpOffTimerActive) {
-        color = statusLeds.Color(0, 0, 255); // pump running = blue
-      } else {
-        color = statusLeds.Color(0, 0, 0);   // off
-      }
-      break;
-  }
 
-  for (uint16_t i = 0; i < LED_COUNT; i++) {
-    statusLeds.setPixelColor(i, color);
+// Chiller pattern brightness for one LED, 0-255: a smooth wave carrying
+// LED_TWINKLE_CREST_COUNT crests around the ring, drifting back and forth
+// between the two ends of the ring. The wave phase is modulated by a sine
+// rather than driven linearly, so the crests slow to a stop at each end and
+// turn around smoothly instead of snapping back and jerking.
+uint8_t twinkleLevel(uint8_t index, unsigned long now) {
+  // Reduced to a single sweep BEFORE converting to float, deliberately. millis()
+  // runs for weeks, and 2*pi*sweep on a sweep count in the hundreds of thousands
+  // has so little left in a 32-bit float mantissa that the argument arrives at
+  // cosf() quantised to whole radians and the twinkle grinds to a standstill.
+  // Reducing in integer arithmetic keeps the argument inside 0..2*pi for the
+  // life of the sketch, and costs nothing.
+  float sweep = (float)(now % LED_TWINKLE_SWEEP_MS) / (float)LED_TWINKLE_SWEEP_MS;
+  float phase = PI * (float)LED_TWINKLE_CREST_COUNT * (float)LED_TWINKLE_DIRECTION
+              * sinf(2.0f * PI * sweep);
+  float angle = 2.0f * PI * (float)LED_TWINKLE_CREST_COUNT
+              * (float)index / (float)LED_COUNT - phase;
+  float wave = 0.5f + 0.5f * cosf(angle); // 0..1
+  // Scaled in float and only rounded at the very end. Truncating the wave to an
+  // int first would collapse it to 0 or 1 and turn the twinkle into a hard
+  // on/off blink between two brightnesses instead of a gradient.
+  float level = (float)LED_TWINKLE_DIM
+              + ((float)LED_TWINKLE_BRIGHT - (float)LED_TWINKLE_DIM) * wave;
+  if (level < 0.0f) level = 0.0f;
+  if (level > 255.0f) level = 255.0f;
+  return (uint8_t)(level + 0.5f);
+}
+
+// Pump pattern brightness for one LED, 0-255: one bright head stepping around
+// the ring, with a short tail fading out behind it and black everywhere else.
+// Distance is counted backwards from the head so the tail wraps the circle
+// rather than running off the end of the strip.
+uint8_t chaseLevel(uint8_t index, unsigned long now) {
+  uint8_t head = (uint8_t)((now / LED_CHASE_STEP_MS) % LED_COUNT);
+  uint8_t behind = (uint8_t)((head + LED_COUNT - index) % LED_COUNT);
+  if (behind == 0) return LED_CHASE_HEAD;
+  if ((size_t)(behind - 1) >=
+      (sizeof(LED_CHASE_TAIL) / sizeof(LED_CHASE_TAIL[0]))) return 0;
+  return LED_CHASE_TAIL[behind - 1];
+}
+
+// Scale a 0-255 brightness onto one channel of a dim->bright colour ramp.
+int rampChannel(uint8_t dim, uint8_t bright, uint8_t level) {
+  return (int)dim + ((int)bright - (int)dim) * (int)level / 255;
+}
+
+// How far the mode-change wipe has got: the number of LEDs from index 0 upwards
+// that have already switched to the new mode. Every LED in the ring once the
+// mode has caught up.
+//
+// Derived from the same timer updateModeSelection() uses rather than from a
+// second counter, so the wipe and the mode change cannot drift apart, and so
+// handleStatusJson() can report the ring's real progress without re-deriving
+// the arithmetic a second time and getting it subtly wrong.
+uint8_t ledRevealCount() {
+  if (currentMode == selectedMode) return LED_COUNT; // settled
+  unsigned long elapsed = millis() - modeChangeStart;
+  if (elapsed >= MODE_SWITCH_DELAY_MS) return LED_COUNT;
+  // elapsed is below the delay, so the multiply cannot overflow.
+  uint8_t lit = (uint8_t)(elapsed * LED_COUNT / MODE_SWITCH_DELAY_MS);
+  if (lit > LED_COUNT) lit = LED_COUNT;
+  return lit;
+}
+
+void updateStatusLeds() {
+  static unsigned long lastFrameAt = 0;
+  static uint8_t lastLit = 0xFF; // no LED is 0xFF, so frame 0 always renders
+
+  unsigned long now = millis();
+
+  // LEDs below this index have switched to the new mode, the rest are still
+  // showing the old one.
+  uint8_t lit = ledRevealCount();
+
+  // Redraw on the animation clock, and immediately whenever the wipe gains a
+  // LED so a mode change is never held up by a frame. Everything in between is
+  // skipped: statusLeds.show() is the one blocking call on an otherwise
+  // non-blocking loop, and there is nothing new to push to the strip.
+  if (lit == lastLit && (now - lastFrameAt) < LED_FRAME_INTERVAL_MS) return;
+  lastFrameAt = now;
+  lastLit = lit;
+
+  // Driven by selectedMode, not currentMode: during the hold the ring is
+  // showing the animation that is about to start, so the wipe reveals the new
+  // pattern rather than fading the old one out. outgoingMode is what the wipe
+  // has not reached yet, so it stays on screen until each LED is taken over.
+  bool chillerOn = (selectedMode == MODE_CHILLER_ONLY || selectedMode == MODE_BOTH);
+  bool pumpOn    = (selectedMode == MODE_PUMP_ONLY   || selectedMode == MODE_BOTH);
+  bool outChiller = (outgoingMode == MODE_CHILLER_ONLY || outgoingMode == MODE_BOTH);
+  bool outPump    = (outgoingMode == MODE_PUMP_ONLY   || outgoingMode == MODE_BOTH);
+
+  for (uint8_t i = 0; i < LED_COUNT; i++) {
+    bool reached = (i < lit);
+    bool chillerHere = reached ? chillerOn : outChiller;
+    bool pumpHere    = reached ? pumpOn    : outPump;
+
+    // Each pattern contributes only while it is running on this LED. Gating on
+    // the pattern and not on its brightness matters: the colour ramps have a dim
+    // end, not a black end, so a pattern that was merely scaled to zero would
+    // still paint its dim colour over every LED instead of disappearing.
+    int r = 0, g = 0, b = 0;
+    if (chillerHere) {
+      uint8_t level = twinkleLevel(i, now);
+      r += rampChannel(LED_CHILLER_DIM_COLOR[0], LED_CHILLER_BRIGHT_COLOR[0], level);
+      g += rampChannel(LED_CHILLER_DIM_COLOR[1], LED_CHILLER_BRIGHT_COLOR[1], level);
+      b += rampChannel(LED_CHILLER_DIM_COLOR[2], LED_CHILLER_BRIGHT_COLOR[2], level);
+    }
+    if (pumpHere) {
+      uint8_t level = chaseLevel(i, now);
+      r += rampChannel(LED_PUMP_DIM_COLOR[0], LED_PUMP_BRIGHT_COLOR[0], level);
+      g += rampChannel(LED_PUMP_DIM_COLOR[1], LED_PUMP_BRIGHT_COLOR[1], level);
+      b += rampChannel(LED_PUMP_DIM_COLOR[2], LED_PUMP_BRIGHT_COLOR[2], level);
+    }
+    // The two patterns are summed per channel and clamped, so in MODE_BOTH the
+    // twinkle and the chase run at the same time and the overlap between them
+    // comes out magenta rather than one pattern washing the other out.
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    statusLeds.setPixelColor(i, statusLeds.Color(r, g, b));
   }
   statusLeds.show();
-  // TODO: consider per-LED assignment (e.g. LED0=pump, LED1=compressor,
-  // LED2=fault, LED3=wifi) instead of a single strip-wide color.
 }
 
 // =========================================================================
@@ -1055,7 +1295,19 @@ const char* modeName() {
     case MODE_PUMP_ONLY:    return "PUMP_ONLY";
     case MODE_CHILLER_ONLY: return "CHILLER_ONLY";
     case MODE_BOTH:         return "BOTH";
-    default:                 return "UNKNOWN";
+    default:                return "UNKNOWN";
+  }
+}
+
+// The position the switch is actually sitting in, which differs from the mode
+// in effect only while the MODE_SWITCH_DELAY_MS hold is running.
+const char* selectedModeName() {
+  switch (selectedMode) {
+    case MODE_OFF:          return "OFF";
+    case MODE_PUMP_ONLY:    return "PUMP_ONLY";
+    case MODE_CHILLER_ONLY: return "CHILLER_ONLY";
+    case MODE_BOTH:         return "BOTH";
+    default:                return "UNKNOWN";
   }
 }
 
@@ -1116,7 +1368,17 @@ void handleStatusJson() {
   int currentAdcValue = read12VCurrentADC();
   String json = "{";
   json += "\"mode\":\"" + String(modeName()) + "\",";
+  // The switch position vs the mode in effect. They differ only while the
+  // MODE_SWITCH_DELAY_MS hold is running, and the countdown is what the UI
+  // shows so the delay reads as a deliberate wait rather than the switch having
+  // been ignored.
+  json += "\"selectedMode\":\"" + String(selectedModeName()) + "\",";
+  json += "\"modeChangeRemainingMs\":" + String(
+      (currentMode != selectedMode &&
+       millis() - modeChangeStart < MODE_SWITCH_DELAY_MS)
+        ? (MODE_SWITCH_DELAY_MS - (millis() - modeChangeStart)) : 0) + ",";
   json += "\"state\":\"" + String(stateName()) + "\",";
+  json += "\"ledRevealCount\":" + String((unsigned long)ledRevealCount()) + ",";
   json += "\"capSeq\":\"" + String(capSeqName()) + "\",";
   json += "\"capArmed\":" + String(capSeq != CAP_SEQ_WAIT_DISCHARGE ? "true" : "false") + ",";
   json += "\"capAdc\":" + String(capAdcValue) + ",";

@@ -46,9 +46,9 @@ const char PAGE_STATUS[] PROGMEM = R"====(
   .needle { transform-origin: 70px 70px; }
   .dialcard.off { border-color: #d33; }
   .modeOFF { color: #666; }
-  .modePUMP_ONLY { color: #0645ad; font-weight: bold; }
-  .modeCHILLER_ONLY { color: #d35400; font-weight: bold; }
-  .modeBOTH { color: #6a1b9a; font-weight: bold; }
+  .modePUMP_ONLY { color: #c0392b; font-weight: bold; }
+  .modeCHILLER_ONLY { color: #1f6fd0; font-weight: bold; }
+  .modeBOTH { color: #a335b0; font-weight: bold; }
   #setMsg { font-size: 12px; margin-left: 6px; }
 </style>
 </head>
@@ -73,6 +73,7 @@ const char PAGE_STATUS[] PROGMEM = R"====(
     <div class="dialInfo">
       <div>Selected: <b id="dialPos">-</b></div>
       <div>Mode: <b id="dialMode">-</b></div>
+      <div id="dialPending" style="color:#888;font-size:11px"></div>
       <div style="color:#888;font-size:11px">up=1 off, right=2 pump,<br>down=3 chiller, left=4 both</div>
     </div>
   </div>
@@ -169,13 +170,14 @@ function fmtMs(ms) {
   return h + 'h ' + (m - (h * 60)) + 'm';
 }
 
-// Mode colors match the status LED colors so the two always agree:
-// OFF=grey, pump only=blue, chiller only=orange, both=purple.
+// Mode colors match the status LED ring colors so the two always agree:
+// OFF=grey, pump only=red, chiller only=blue, both=magenta (red chase + blue
+// twinkle lit at the same time).
 var MODE_COLOR = {
   'OFF':           '#666666',
-  'PUMP_ONLY':     '#0645ad',
-  'CHILLER_ONLY':  '#d35400',
-  'BOTH':          '#6a1b9a'
+  'PUMP_ONLY':     '#c0392b',
+  'CHILLER_ONLY':  '#1f6fd0',
+  'BOTH':          '#a335b0'
 };
 
 function modeSpan(mode) {
@@ -196,14 +198,14 @@ var DIAL_ARROW = {
 };
 
 function activePosition(d) {
-  // Count the active inputs and only report a position when exactly one is
-  // settled. Returning the first match would make the dial show a definite
-  // position while the firmware itself is in the failsafe OFF state - the two
-  // would disagree, which is the last thing you want on a control indicator.
-  var n = (d.switch1 ? 1 : 0) + (d.switch2 ? 1 : 0) +
-          (d.switch3 ? 1 : 0) + (d.switch4 ? 1 : 0);
-  if (n !== 1) return 0; // none, or more than one -> failsafe OFF
-  if (d.switch1) return 1;
+  // Mirrors getSwitchMode(): position 1 has no input of its own, so it is
+  // selected implicitly whenever none of the wired positions 2/3/4 are active.
+  // More than one wired position active is a fault, and the firmware fails safe
+  // to OFF - report no position there rather than a definite one the firmware
+  // disagrees with, which is the last thing you want on a control indicator.
+  var wired = (d.switch2 ? 1 : 0) + (d.switch3 ? 1 : 0) + (d.switch4 ? 1 : 0);
+  if (wired === 0) return 1; // position 1 (off), selected by the absence of 2/3/4
+  if (wired > 1) return 0;   // ambiguous -> failsafe OFF
   if (d.switch2) return 2;
   if (d.switch3) return 3;
   return 4;
@@ -241,6 +243,17 @@ function updateDial(d) {
   document.getElementById('dialPos').textContent =
     pos === 0 ? 'none / failsafe OFF' : pos;
   document.getElementById('dialMode').innerHTML = modeSpan(d.mode);
+
+  // While a mode change is being held the switch and the mode in effect
+  // legitimately disagree, so say so with a countdown rather than let the dial
+  // look like the switch was ignored.
+  var pend = document.getElementById('dialPending');
+  if (d.modeChangeRemainingMs > 0) {
+    pend.innerHTML = 'switch is on ' + modeSpan(d.selectedMode) +
+      ' &middot; takes effect in ' + fmtMs(d.modeChangeRemainingMs);
+  } else {
+    pend.textContent = '';
+  }
 }
 
 // Only push form values from the device when the user isn't mid-edit, so a
@@ -318,6 +331,11 @@ function refresh() {
     setInput('vcur', d.currentLimitVolts, 'c');
     setInput('bhz', d.buzzerHz, 'hz');
     html += row('Mode', modeSpan(d.mode));
+    if (d.modeChangeRemainingMs > 0) {
+      html += row('Pending mode', modeSpan(d.selectedMode) + ' in ' +
+                  fmtMs(d.modeChangeRemainingMs) +
+                  ' <span class="gpio">ring reveal ' + d.ledRevealCount + ' LEDs</span>');
+    }
     html += row('State', d.state);
     html += row('Cap sequence', d.capSeq + ' (armed: ' + (d.capArmed ? 'yes' : 'no') + ')');
     html += row('Capacitor', d.capVolts + ' V <span class="gpio">adc ' + d.capAdc + '</span> &middot; arms &le;' +

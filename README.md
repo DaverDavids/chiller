@@ -267,19 +267,74 @@ and immediately restart the pump. It also stays on whenever the compressor is
 running, so the 12V rail is never cut out from under a closed contact. Adjust
 `PUMP_OFF_DELAY_MS` to taste.
 
+## Mode change delay
+
+A newly selected switch position is **not** acted on when it is read. The mode
+that was already in effect keeps running for `MODE_SWITCH_DELAY_MS` (3 s) first,
+and only then does the new mode take effect. `updateModeSelection()` owns this
+and is the only writer of the mode state.
+
+This gates the hardware, not just the LEDs. `pumpRequested` and
+`compressorRequested` are derived from the mode *in effect*, so the pump and the
+compressor both wait the window out. A switch nudged into a new position and
+back again can never reach either output, and the delay cannot be skipped by
+re-reading the switch: during the hold the reading is already the new mode, it
+just isn't in effect yet.
+
+The web UI shows both the switch position and the mode in effect while the hold
+is running, with a countdown, so the delay reads as a deliberate wait rather
+than the switch having been ignored.
+
 ## Status LEDs
 
-An addressable LED strip (Adafruit_NeoPixel) shows current status:
+`LED_COUNT` WS2812Bs joined end to end into a **ring**, with one animation per
+mode:
 
-- Off: idle, nothing running
-- Blue: pump running (pump-only mode, or in the off-delay hold window)
-- Yellow: charging the capacitor, contacts still open
-- Orange: chiller running, pump not otherwise requested
-- Purple: chiller and pump both running
-- Flashing red: fault latched
+| Mode | Animation |
+|---|---|
+| Off (position 1) | black |
+| Pump only | a red chase stepping slowly around the ring, with a short tail fading out behind the head |
+| Chiller only | blueish shades twinkling back and forth around the ring |
+| Both | the twinkle and the chase at the same time, mixed additively so the overlap goes magenta |
 
-This is a strip-wide single-color scheme for now - see the TODO in
-`updateStatusLeds()` for per-LED per-function assignment.
+Both patterns are written to close on themselves, because the strip is a circle:
+the twinkle carries a whole number of crests around the loop, and the chase
+measures distance backwards so its tail wraps behind its head rather than
+running off the end.
+
+Every knob that decides how the ring looks - crest count, sweep time, chase
+step, brightnesses, tail length and the dim/bright colour of each pattern - is
+in a single tunables block next to `LED_COUNT` in `chiller.ino`, so the pattern
+can be dialled in without reading the renderer.
+
+### The wipe on a mode change
+
+A mode change is not instantaneous visually either. The ring spends exactly the
+same `MODE_SWITCH_DELAY_MS` window switching over from LED 0 upwards, showing
+the animation that is *about to* take effect. The last LED switches on the same
+tick the mode becomes current, so the animation is never caught half-revealed.
+
+LEDs the wipe has not reached yet still show the mode being **replaced**, not
+black. One rule then covers both directions: filling up from off reveals the new
+animation LED by LED, and going to off - whose animation is black - extinguishes
+the old animation LED by LED instead of blanking the whole ring in one step.
+
+### State is no longer shown on the ring
+
+The ring now shows *mode*, not machine *state*. The old scheme signalled the
+fault latch (flashing red) and precharge (yellow) with strip-wide colours; both
+were dropped, because the mode animations now own the ring and a chiller-only
+twinkle is a better read of "the chiller is selected" than a fixed colour was.
+**A latched fault is therefore no longer visible on the LEDs** - it is still
+reported in the web UI, on `/status`, and in the serial log. If you want the
+fault back on the ring, the clean way is to overlay it in `updateStatusLeds()`
+rather than fold it into the mode patterns, so the wipe is not disturbed.
+
+`updateStatusLeds()` only redraws on `LED_FRAME_INTERVAL_MS` (30 ms) or when the
+wipe gains an LED, because `statusLeds.show()` is the one blocking call on an
+otherwise non-blocking loop and there is no point pushing an identical frame to
+the strip. `updateStatusLeds()` reads the mode state only; it drives no output
+pin and cannot reach the pump or the compressor.
 
 ## Web UI
 
@@ -289,14 +344,19 @@ that polls `/status` (JSON) every second.
 **Switch dial.** A dial graphic at the top mirrors the physical 4-position
 switch: **up = 1 (off), right = 2 (pump), down = 3 (chiller), left = 4 (both)**.
 The needle animates to the debounced active position, the active position number
-is highlighted, and the mode is shown beside it. If the firmware reads zero or
-more than one position active it is in the failsafe-OFF state, so the needle
-greys out and the panel reads `none / failsafe OFF` - the dial will show that
-rather than a false position. Position 1 renders dimmed as unwired.
+is highlighted, and the mode is shown beside it. Position 1 has no input of its
+own (`PIN_SWITCH_1` is unwired) and is selected implicitly whenever none of
+positions 2/3/4 read active. If the firmware reads more than one wired position
+active it is in the failsafe-OFF state, so the needle greys out and the panel
+reads `none / failsafe OFF` - the dial will show that rather than a false
+position.
 
-**Mode colors** match the status LED colors exactly, so the two always agree:
-OFF = grey, pump only = blue, chiller only = orange, both = purple. The color is
-applied to the Mode row in the table and to the mode readout beside the dial.
+**Mode colors** match the status LED ring colors exactly, so the two always
+agree: OFF = grey, pump only = red, chiller only = blue, both = magenta. The
+color is applied to the Mode row in the table and to the mode readout beside the
+dial. While a mode change is being held, the dial also shows the switch position
+and a countdown to when it takes effect, and the table gains a `Pending mode`
+row with the reveal progress.
 
 Every row also shows the raw GPIO number and pin level next to its label (e.g.
 `Compressor  8=LOW`), read straight from `digitalRead()` so what you see is the
@@ -404,7 +464,16 @@ and precharge timeouts.
   that timer is not actually wired, the compressor will never run.
 - Confirm whether the timer input should gate/AND with the switch mode for
   compressor demand, or be removed/repurposed now that the switch exists.
-- `LED_COUNT` is a placeholder - set it to the actual strip length.- Per-LED status mapping instead of single strip-wide color.
+- `LED_COUNT` is set to 10 for the ring, but the physical LED count has not been
+  confirmed against the hardware - check it and adjust the one `#define`.
+- The ring no longer shows a latched fault. If that is wanted back, overlay it in
+  `updateStatusLeds()` rather than folding it into the mode patterns.
+- The LED animation tunables (crest count, sweep, chase step, brightnesses, tail,
+  colours) are untested on the bench - they were chosen to be gentle and need a
+  real eye on the ring.
+- `MODE_SWITCH_DELAY_MS` (3 s) is a judgement call. It is long enough that a
+  switch bounce cannot reach the outputs, but it does mean a deliberate mode
+  change has a visible dead time before anything happens.
 - Fan/buzzer have no automatic behaviour at all yet - they are manual-test
   outputs only. They need real demand logic.
 - Optionally add a `CAP_MAX_DISCHARGE_MS` limit so a capacitor that never bleeds
