@@ -87,8 +87,27 @@ const unsigned long DEBUG_PRINT_INTERVAL_MS = 2000; // TODO: tune to taste
 
 // ============================= NETWORK =================================
 #define HOSTNAME "chiller"
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long WIFI_RETRY_INTERVAL_MS  = 30000;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
+const unsigned long WIFI_RETRY_INTERVAL_MS  = 3000;
+
+// Connection is a non-blocking state machine rather than a blocking
+// wait-for-connected loop. A blocking attempt would stall loop() for up to
+// WIFI_CONNECT_TIMEOUT_MS, and loop() is what runs the compressor interlock -
+// so every retry would delay a 12V overcurrent trip by that much, with the
+// contacts held closed. Never block here.
+enum WifiPhase {
+  WIFI_PHASE_IDLE,       // not connected, no attempt in flight
+  WIFI_PHASE_CONNECTING, // attempt in flight, being polled each loop
+  WIFI_PHASE_CONNECTED   // STA up and usable
+};
+WifiPhase wifiPhase = WIFI_PHASE_IDLE;
+unsigned long wifiConnectStart = 0;
+unsigned long lastWifiAttempt = 0;
+bool otaReady = false;
+bool mdnsReady = false;
+// Set by handleSave() so the next loop() starts a connect attempt with the new
+// credentials. Using a flag rather than delay() keeps the interlock running.
+bool wifiReconnectRequested = false;
 
 // ============================= PIN MAP ==================================
 #define PIN_CAP_SENSE  0   // ADC1 channel, capacitor voltage sense
@@ -132,6 +151,53 @@ int CAP_CHARGED_ADC_MIN   = 3000; // at/above this the capacitor counts as
 int COMPRESSOR_SAFE_ADC_MAX = 500;      // placeholder, 0-4095 (12-bit ADC)
 const uint8_t ADC_SAMPLE_COUNT = 8;     // simple averaging, tune later
 
+// ==================== ADC <-> VOLTS CONVERSION ============================
+// The capacitor sense line reaches GPIO0 through a 1k series resistor with no
+// divider, so the pin sees the capacitor voltage directly and the scaling
+// ratio is 1.0. Change CAP_SENSE_DIVIDER if a divider is ever fitted.
+//
+// The 12V current sense on GPIO2 has its own, separate scaling - it runs through
+// a sense amplifier, and CURRENT_SENSE_DIVIDER is the factor that turns the pin
+// voltage back into the real 12V rail current sense. It is UNCALIBRATED: the
+// placeholder of 1.0 makes the volts readout equal the pin voltage, so treat it
+// as indicative until you measure the real ratio against a known load current.
+//
+// The C3's ADC is measurably nonlinear, especially near the rails, so treat the
+// volts figures as INDICATIVE and calibrate against a multimeter. The interlock
+// itself works entirely in raw ADC counts, so a volts error can never make it
+// unsafe - it would only mis-set a threshold.
+const float ADC_REFERENCE_V     = 3.3f;
+const float CAP_SENSE_DIVIDER   = 1.0f;
+const float CURRENT_SENSE_DIVIDER = 1.0f; // TODO: calibrate against a known load
+const int   ADC_FULL_SCALE      = 4095;
+
+float adcToVoltsScaled(int adc, float divider) {
+  return (adc * (ADC_REFERENCE_V / (float)ADC_FULL_SCALE)) * divider;
+}
+
+int voltsToAdcScaled(float volts, float divider) {
+  if (divider <= 0.0f) return 0;
+  float counts = volts / (ADC_REFERENCE_V * divider) * (float)ADC_FULL_SCALE;
+  if (counts < 0.0f) counts = 0.0f;
+  if (counts > (float)ADC_FULL_SCALE) counts = (float)ADC_FULL_SCALE;
+  return (int)(counts + 0.5f);
+}
+
+// Capacitor sense (GPIO0) helpers.
+float adcToVolts(int adc)         { return adcToVoltsScaled(adc, CAP_SENSE_DIVIDER); }
+int   voltsToAdc(float volts)     { return voltsToAdcScaled(volts, CAP_SENSE_DIVIDER); }
+
+// 12V current sense (GPIO2) helpers.
+float currentAdcToVolts(int adc)  { return adcToVoltsScaled(adc, CURRENT_SENSE_DIVIDER); }
+int   currentVoltsToAdc(float v)  { return voltsToAdcScaled(v, CURRENT_SENSE_DIVIDER); }
+
+// Minimum gap that must stay between the two capacitor thresholds, in ADC
+// counts. The gap between them IS the hysteresis band: with it, a start always
+// discharges first and charges second. Enforced on every change so the web UI
+// (or a corrupted flash value) can't collapse the band and let the contacts
+// close on a charged capacitor.
+const int CAP_THRESHOLD_MIN_GAP = 200; // ~0.16V at ratio 1.0
+
 // How long the charge output may be energized without the capacitor reaching
 // CAP_CHARGED_ADC_MIN before the fault latches and the contacts stay open.
 const unsigned long PRECHARGE_TIMEOUT_MS = 30000; // TODO: tune to taste
@@ -141,9 +207,44 @@ const unsigned long PRECHARGE_TIMEOUT_MS = 30000; // TODO: tune to taste
 // simply bouncing the switch.
 const unsigned long FAULT_RESET_HOLD_MS = 5000; // TODO: tune to taste
 
+// Compressor minimum run time. Once the contacts close they stay closed for at
+// least this long, so a brief demand dip (switch bounce, a momentary timer
+// low) can't short-cycle the compressor.
+// A safety trip (12V overcurrent) still opens the contacts immediately with no
+// hold at all - this only covers a demand-driven stop.
+const unsigned long COMPRESSOR_MIN_RUN_MS = 5000; // TODO: tune to taste
+
+// Compressor off-delay. SEPARATE from the minimum run time above: once the
+// minimum run time is satisfied, removing demand does not open the contacts
+// straight away - they stay closed for this long first. If demand comes back
+// inside that window the compressor never stopped at all, so it just resumes
+// running: no stop, no capacitor discharge, no re-charge, no contactor cycle.
+//
+// This is why the two are separate. A minimum run time alone cannot do this:
+// once a compressor has been running longer than the minimum, removing demand
+// satisfies the "minimum elapsed" test immediately and it would stop on the
+// spot, then have to discharge and re-charge to restart.
+//
+// The contacts only open when BOTH have elapsed: the minimum run time since
+// the last start, and this off-delay since demand was removed.
+const unsigned long COMPRESSOR_OFF_DELAY_MS = 5000; // TODO: tune to taste
+
+// Switch input debounce. A raw reading only becomes the accepted position
+// after it has been stable this long. Mode switches bounce for a few ms, and
+// any transient 0-or-2-active read is treated as a fault that stops
+// everything, so require a settled reading before acting on it.
+const unsigned long SWITCH_DEBOUNCE_MS = 500; // TODO: tune to taste
+
 // Pump anti-short-cycle hold time. 12V enable stays on this long after pump
 // demand drops, so switching modes doesn't stop/restart the pump every time.
-const unsigned long PUMP_OFF_DELAY_MS = 5000; // TODO: tune to taste
+const unsigned long PUMP_OFF_DELAY_MS = 1000; // TODO: tune to taste
+
+// Buzzer test tone frequency, in Hz. The buzzer is driven as a pulsed square
+// wave at this rate - it is never held at a static DC level, which would either
+// produce no sound (most piezo elements need AC) or overheat the element.
+int buzzerFrequency = 2000;                 // persisted, settable from the web UI
+const int BUZZER_FREQ_MIN = 100;
+const int BUZZER_FREQ_MAX = 8000;
 
 // ============================ MODES / STATE ==============================
 enum ChillerMode {
@@ -181,6 +282,34 @@ bool compressorFault = false;    // latched precharge timeout; blocks all starts
 bool faultResetArmed = false;    // demand-removal hold for clearing the fault
 unsigned long faultResetStart = 0;
 unsigned long capChargeStart = 0; // when the charge output was asserted
+unsigned long compressorRunStart = 0; // when the contacts closed
+// When demand was last removed from a running compressor. 0 means "no stop
+// pending". Demand returning clears it, which is how a brief OFF-then-ON
+// resumes the same run instead of starting a new one.
+unsigned long compressorStopRequestedAt = 0;
+
+// Capacitor discharge timing. Measures how long the capacitor has been sitting
+// below CAP_CHARGED_ADC_MIN - i.e. bleeding down since it last read charged.
+// Purely a health indicator for the discharge path: a capacitor that never
+// bleeds down points at a failed bleeder, and would block the next start.
+unsigned long capDischargeStart = 0;
+unsigned long lastCapDischargeMs = 0; // duration of the most completed discharge
+bool capDischargeTiming = false;
+
+// Buzzer tone state. The tone is started/stopped on transitions only, so
+// updateBuzzerOutput() costs a boolean compare per loop when idle.
+bool buzzerToneActive = false;
+
+// Switch debounce state, one entry per position. Reads raw from the pin but
+// only publishes switchNState once the raw value has been stable for
+// SWITCH_DEBOUNCE_MS.
+struct DebouncedSwitch {
+  bool stable = false;            // last accepted value
+  bool candidate = false;         // value currently being confirmed
+  unsigned long candidateSince = 0;
+};
+DebouncedSwitch switchDebounce[4];
+const uint8_t SWITCH_COUNT = 4;
 
 // Switch position states, updated each loop by readSwitchInputs()
 bool switch1State = false;
@@ -200,7 +329,6 @@ Preferences prefs;
 WebServer server(80);
 DNSServer dnsServer;
 bool apMode = false;
-unsigned long lastWifiAttempt = 0;
 
 String cfgSsid;
 String cfgPass;
@@ -216,20 +344,32 @@ void runStateMachine();
 void readSwitchInputs();
 bool readSwitchActive(int pin);
 void setupSwitchPin(int pin);
+void updateDebounced(DebouncedSwitch &d, bool raw);
 ChillerMode getSwitchMode();
 void applyMode();
 void updateStatusLeds();
-void connectWiFi();
+void serviceWifi();
+void startWifiAttempt();
 void startCaptivePortal();
+void leaveCaptivePortal();
+void registerStatusRoutes();
+void onWifiConnected();
 void handleRoot();
+void handleNotFound();
 void handleSave();
 void handleStatusJson();
 void handleTestFan();
 void handleTestBuzzer();
 void handleTestCompressor();
+void handleSetThresholds();
+void handleSetCurrentLimit();
+void handleSetBuzzer();
 void setupOTA();
 void loadSettings();
+void saveThresholds();
+void saveBuzzerFrequency();
 void saveSettings(const String &ssid, const String &pass);
+void updateBuzzerOutput();
 const char* stateName();
 const char* modeName();
 const char* capSeqName();
@@ -249,7 +389,13 @@ void setup() {
   pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);   // default HIGH per spec
   pinMode(PIN_CAP_SENSE, INPUT);   // analog: capacitor voltage sense
   pinMode(PIN_ADC_12V, INPUT);     // analog: 12V current sense
-  pinMode(PIN_TIMER_IN, INPUT);    // TODO: confirm pull-up/pull-down and active level
+  // Timer input is treated as active-HIGH (see applyMode()). Configured with
+  // an explicit pull-DOWN so an unwired or floating timer deterministically
+  // reads LOW = inactive, which blocks compressor demand, instead of randomly
+  // enabling or disabling the chiller.
+  // TODO: confirm against the real timer circuit. If it needs a pull-UP
+  // instead, change this and the read in applyMode() together.
+  pinMode(PIN_TIMER_IN, INPUT_PULLDOWN);
 
   // Mode-select switch inputs - ACTIVE LOW: the switch shorts the pin to GND
   // to close its position, internal pull-up holds it HIGH when open. Positions
@@ -271,21 +417,11 @@ void setup() {
   statusLeds.show(); // all off at boot
 
   loadSettings();
-  connectWiFi();
 
-  if (!apMode) {
-    setupOTA();
-    if (MDNS.begin(HOSTNAME)) {
-      DBG_PRINTLN("mDNS started: " HOSTNAME ".local");
-    }
-    server.on("/", handleRoot);
-    server.on("/save", HTTP_POST, handleSave);
-    server.on("/status", handleStatusJson);
-    server.on("/test/fan", handleTestFan);
-    server.on("/test/buzzer", handleTestBuzzer);
-    server.on("/test/compressor", handleTestCompressor);
-    server.begin();
-  }
+  // Non-blocking first attempt - serviceWifi() in loop() drives it to
+  // completion, so setup() never waits on the network and never delays the
+  // interlock coming up.
+  startWifiAttempt();
 }
 
 void loop() {
@@ -306,25 +442,23 @@ void loop() {
 
   // ---- manual test outputs for fan/buzzer (non-safety-critical) ----
   digitalWrite(PIN_FAN, (testFanOverrideActive ? testFanOverride : false) ? HIGH : LOW);
-  digitalWrite(PIN_BUZZER, (testBuzzerOverrideActive ? testBuzzerOverride : false) ? HIGH : LOW);
+  updateBuzzerOutput();
 
   // ---- status LEDs ----
   updateStatusLeds();
 
   // ---- network maintenance (non-blocking, no delay() in loop) ----
+  // Connect/retry runs in ALL modes, including while the AP is up. The old code
+  // only retried when apMode was false, so a device that dropped onto the
+  // captive portal retried nothing and stayed there until it was power cycled.
+  serviceWifi();
+
   if (apMode) {
     dnsServer.processNextRequest();
-    server.handleClient();
   } else {
-    if (WiFi.status() != WL_CONNECTED) {
-      if (millis() - lastWifiAttempt > WIFI_RETRY_INTERVAL_MS) {
-        connectWiFi();
-      }
-    } else {
-      ArduinoOTA.handle();
-      server.handleClient();
-    }
+    if (wifiPhase == WIFI_PHASE_CONNECTED) ArduinoOTA.handle();
   }
+  server.handleClient();
 }
 
 // =========================================================================
@@ -380,6 +514,14 @@ bool is12VCurrentSafe() {
 //   RUNNING        -> contacts closed, charge output held HIGH.
 //   Any stop       -> contacts open, charging stops, and the next start must
 //                     re-arm from a discharged capacitor.
+//   Minimum run    -> once the contacts close they stay closed for at least
+//                     COMPRESSOR_MIN_RUN_MS, and for a further
+//                     COMPRESSOR_OFF_DELAY_MS after demand is removed. Demand
+//                     returning inside that second window clears the pending
+//                     stop, so the compressor resumes the SAME run: no stop, no
+//                     discharge, no re-charge. Overcurrent is checked BEFORE
+//                     either hold, so a safety trip still opens the contacts
+//                     immediately.
 //   Contacts not closed within PRECHARGE_TIMEOUT_MS of charging starting ->
 //                     latched fault. This bounds the whole charging phase, not
 //                     just the "not charged yet" part, so the charge output
@@ -387,23 +529,46 @@ bool is12VCurrentSafe() {
 //                     are never closed on an unproven capacitor.
 // =========================================================================
 void updateCompressorInterlock(bool wantCompressor) {
+  int cap = readCapacitorADC();
+
+  // Discharge timing runs every loop, faulted or not, so the web UI keeps
+  // showing a live reading. Restarts each time the cap rises back to charged.
+  if (cap < CAP_CHARGED_ADC_MIN) {
+    if (!capDischargeTiming) {
+      capDischargeTiming = true;
+      capDischargeStart = millis();
+    }
+  } else if (capDischargeTiming) {
+    capDischargeTiming = false;
+    lastCapDischargeMs = millis() - capDischargeStart;
+  }
+
   // Latched fault: everything off, and no charging, until the state machine
   // clears it after the reset hold.
   if (compressorFault) {
     digitalWrite(PIN_COMPRESSOR, LOW);
     digitalWrite(PIN_CAP_CHARGE, LOW);
     compressorRunning = false;
+    compressorStopRequestedAt = 0;
     capSeq = CAP_SEQ_WAIT_DISCHARGE;
     return;
   }
 
-  int cap = readCapacitorADC();
-
   switch (capSeq) {
     case CAP_SEQ_WAIT_DISCHARGE:
+      // Contacts open, and the charge output is parked LOW here UNCONDITIONALLY
+      // - before the arm test below, not inside it. That ordering is the point:
+      // a run may be requested while the capacitor is still charged, and the
+      // charge output must be off in that case so the capacitor is free to bleed
+      // down to CAP_DISCHARGED_ADC_MAX. If charging were left on here it would
+      // hold the capacitor at the charged voltage forever, the arm test would
+      // never be satisfied, and the compressor would never run again.
       digitalWrite(PIN_COMPRESSOR, LOW);
       digitalWrite(PIN_CAP_CHARGE, LOW);
       compressorRunning = false;
+      compressorStopRequestedAt = 0;
+      // Re-arm only once the capacitor is actually seen discharged AND the
+      // compressor is being requested. Merely requesting a run is not enough.
       if (wantCompressor && (cap <= CAP_DISCHARGED_ADC_MAX)) {
         capSeq = CAP_SEQ_CHARGING;
         capChargeStart = millis();
@@ -416,8 +581,10 @@ void updateCompressorInterlock(bool wantCompressor) {
       compressorRunning = false;
 
       if (!wantCompressor) {
-        // Demand went away mid-charge. Stop charging and go back to waiting
-        // for a full discharge before the next attempt.
+        // Demand went away mid-charge. Stop charging now rather than leaving
+        // the charge output HIGH until the next loop, so the pin state is
+        // deterministic within this same iteration.
+        digitalWrite(PIN_CAP_CHARGE, LOW);
         capSeq = CAP_SEQ_WAIT_DISCHARGE;
         break;
       }
@@ -441,30 +608,85 @@ void updateCompressorInterlock(bool wantCompressor) {
         // only now may the contacts close.
         digitalWrite(PIN_COMPRESSOR, HIGH);
         compressorRunning = true;
+        compressorRunStart = millis();
         capSeq = CAP_SEQ_RUNNING;
       }
       break;
 
     case CAP_SEQ_RUNNING: {
-      bool overcurrent = !is12VCurrentSafe();
-      if (!wantCompressor || overcurrent) {
-        // Stop requested, or overcurrent while running: open the contacts on
-        // the very next loop and stop charging. Restarting needs a fresh
-        // discharge, so this cannot become a fast on/off cycle.
+      // Safety trip, checked before the off-delay hold so it can never be
+      // delayed by it: 12V overcurrent opens the contacts on this very loop.
+      if (!is12VCurrentSafe()) {
         digitalWrite(PIN_COMPRESSOR, LOW);
         digitalWrite(PIN_CAP_CHARGE, LOW);
         compressorRunning = false;
+        compressorStopRequestedAt = 0;
         capSeq = CAP_SEQ_WAIT_DISCHARGE;
-        DBG_PRINTF("[CURRENT] contacts opened (%s)\n",
-                   overcurrent ? "overcurrent" : "demand removed");
-      } else {
-        // Keep the capacitor topped up for the life of the run.
+        DBG_PRINTLN("[CURRENT] contacts opened (overcurrent)");
+        break;
+      }
+
+      // Track demand removal. Demand coming back clears the pending stop, which
+      // is what makes an OFF-then-ON inside the off-delay window resume the
+      // same run rather than opening the contacts and starting over.
+      if (wantCompressor) {
+        compressorStopRequestedAt = 0;
+      } else if (compressorStopRequestedAt == 0) {
+        compressorStopRequestedAt = millis();
+      }
+
+      bool minRunElapsed  = (millis() - compressorRunStart) >= COMPRESSOR_MIN_RUN_MS;
+      bool offDelayElapsed = (compressorStopRequestedAt != 0) &&
+                            (millis() - compressorStopRequestedAt >= COMPRESSOR_OFF_DELAY_MS);
+
+      if (compressorStopRequestedAt != 0 && !(minRunElapsed && offDelayElapsed)) {
+        // Either the minimum run time hasn't been met yet, or the off-delay is
+        // still running. Stay closed and keep the capacitor charged, so a brief
+        // demand dip or an OFF-then-ON can't short-cycle the compressor.
         digitalWrite(PIN_CAP_CHARGE, HIGH);
         digitalWrite(PIN_COMPRESSOR, HIGH);
         compressorRunning = true;
+        break;
       }
+
+      // Both holds satisfied - normal stop. Contacts open, charging stops, and
+      // the next start must re-arm from a discharged capacitor.
+      digitalWrite(PIN_COMPRESSOR, LOW);
+      digitalWrite(PIN_CAP_CHARGE, LOW);
+      compressorRunning = false;
+      compressorStopRequestedAt = 0;
+      capSeq = CAP_SEQ_WAIT_DISCHARGE;
+      DBG_PRINTLN("[COMPRESSOR] min run + off delay elapsed, contacts opened");
       break;
     }
+  }
+}
+
+// =========================================================================
+// BUZZER OUTPUT - pulsed, never static DC
+// The buzzer element is driven as a square wave at buzzerFrequency. Holding a
+// buzzer at a steady DC level produces no sound from a piezo element and will
+// cook a magnetic one, so it must be pulsed. tone() is LEDC-backed and
+// non-blocking, so the pulsing costs nothing on the safety-critical path -
+// tone()/noTone() are only called on an actual on/off transition, never per
+// loop.
+// =========================================================================
+void updateBuzzerOutput() {
+  bool wantTone = testBuzzerOverrideActive && testBuzzerOverride;
+
+  if (wantTone) {
+    if (!buzzerToneActive) {
+      tone(PIN_BUZZER, buzzerFrequency);
+      buzzerToneActive = true;
+    }
+  } else {
+    if (buzzerToneActive) {
+      noTone(PIN_BUZZER);
+      buzzerToneActive = false;
+    }
+    // noTone() leaves the pin as an output, so make sure it is parked LOW
+    // rather than left floating once the tone stops.
+    if (!buzzerToneActive) digitalWrite(PIN_BUZZER, LOW);
   }
 }
 
@@ -501,7 +723,7 @@ void update12VEnable(bool pumpDemandNow, bool compressorIsRunning) {
 
 // =========================================================================
 // MODE-SELECT SWITCH INPUTS - ACTIVE LOW (switch closes to GND), internal
-// pull-ups enabled in setup(). TODO: add debounce on position change.
+// pull-ups enabled in setup(), plus a stability filter per input.
 // =========================================================================
 void setupSwitchPin(int pin) {
   if (pin < 0) return; // position not wired - nothing to configure
@@ -513,11 +735,37 @@ bool readSwitchActive(int pin) {
   return digitalRead(pin) == LOW;
 }
 
+// Publish `raw` as the accepted value only once it has been stable for
+// SWITCH_DEBOUNCE_MS. Any change restarts the window, so a bouncing contact
+// never reaches the mode selection.
+void updateDebounced(DebouncedSwitch &d, bool raw) {
+  if (raw != d.candidate) {
+    // Different from the reading being confirmed - restart the window.
+    d.candidate = raw;
+    d.candidateSince = millis();
+    return;
+  }
+  if (d.candidate != d.stable && (millis() - d.candidateSince >= SWITCH_DEBOUNCE_MS)) {
+    d.stable = d.candidate;
+  }
+}
+
 void readSwitchInputs() {
-  switch1State = readSwitchActive(PIN_SWITCH_1);
-  switch2State = readSwitchActive(PIN_SWITCH_2);
-  switch3State = readSwitchActive(PIN_SWITCH_3);
-  switch4State = readSwitchActive(PIN_SWITCH_4);
+  // int, not uint8_t: an unwired position is -1, which won't narrow.
+  const int pins[SWITCH_COUNT] = {
+    PIN_SWITCH_1, PIN_SWITCH_2, PIN_SWITCH_3, PIN_SWITCH_4
+  };
+  bool states[SWITCH_COUNT];
+
+  for (uint8_t i = 0; i < SWITCH_COUNT; i++) {
+    updateDebounced(switchDebounce[i], readSwitchActive(pins[i]));
+    states[i] = switchDebounce[i].stable;
+  }
+
+  switch1State = states[0];
+  switch2State = states[1];
+  switch3State = states[2];
+  switch4State = states[3];
 }
 
 ChillerMode getSwitchMode() {
@@ -534,7 +782,12 @@ ChillerMode getSwitchMode() {
 }
 
 void applyMode() {
-  bool timerEnabled = (digitalRead(PIN_TIMER_IN) == HIGH); // TODO: confirm active level and desired AND/OR logic with mode
+  // Active level matches the INPUT_PULLDOWN in setup(): HIGH = timer on. With
+  // the pin unwired the pull-down holds this LOW, so chiller demand is blocked
+  // rather than floating.
+  // TODO: confirm the timer should gate compressor demand at all, and how it
+  // should combine with the switch mode.
+  bool timerEnabled = (digitalRead(PIN_TIMER_IN) == HIGH);
 
   bool modePump     = (currentMode == MODE_PUMP_ONLY || currentMode == MODE_BOTH);
   bool modeChiller   = (currentMode == MODE_CHILLER_ONLY || currentMode == MODE_BOTH);
@@ -627,37 +880,125 @@ void runStateMachine() {
 // =========================================================================
 // WIFI / OTA / CAPTIVE PORTAL
 // =========================================================================
-void connectWiFi() {
-  lastWifiAttempt = millis();
+// All of this is polled from serviceWifi() once per loop() and never blocks.
+// =========================================================================
+
+// 404 for unknown paths on the real network. Installed over the captive
+// portal's catch-all, which would otherwise keep answering every mistyped URL
+// with the config page.
+void handleNotFound() {
+  if (apMode) {
+    server.send(200, "text/html", PAGE_CONFIG); // portal detection probe
+  } else {
+    server.send(404, "text/plain", "Not found");
+  }
+}
+
+// Register the live-status routes. Called on every successful STA connection so
+// a device that reached the AP first still ends up with a working status page.
+void registerStatusRoutes() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatusJson);
+  server.on("/test/fan", handleTestFan);
+  server.on("/test/buzzer", handleTestBuzzer);
+  server.on("/test/compressor", handleTestCompressor);
+  server.on("/set/thresholds", handleSetThresholds);
+  server.on("/set/current", handleSetCurrentLimit);
+  server.on("/set/buzzer", handleSetBuzzer);
+  server.onNotFound(handleNotFound);
+  server.begin();
+}
+
+// Tear the AP down when STA comes up, and swap the status routes in. The
+// captive portal's catch-all has to go, or every request on the real network
+// would keep being answered with the config page.
+void leaveCaptivePortal() {
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
   apMode = false;
   WiFi.mode(WIFI_STA);
+  registerStatusRoutes();
+  DBG_PRINTLN("[WIFI] left captive portal, status page now available");
+}
+
+void onWifiConnected() {
+  wifiPhase = WIFI_PHASE_CONNECTED;
+  if (apMode) leaveCaptivePortal();
+
+  if (!otaReady) { setupOTA(); otaReady = true; }
+  if (!mdnsReady) {
+    if (MDNS.begin(HOSTNAME)) {
+      mdnsReady = true;
+      DBG_PRINTLN("mDNS started: " HOSTNAME ".local");
+    }
+  }
+  lastWifiAttempt = millis();
+  DBG_PRINTLN("[WIFI] connected: " + WiFi.localIP().toString());
+}
+
+// Kick off a non-blocking connection attempt. No waiting here - the result is
+// picked up by serviceWifi() on the following loops.
+void startWifiAttempt() {
+  lastWifiAttempt = millis();
+  wifiConnectStart = millis();
+  wifiPhase = WIFI_PHASE_CONNECTING;
+  // Stay in APSTA while the AP is up so the captive portal remains reachable
+  // during a retry; drop to plain STA if it isn't.
+  WiFi.mode(apMode ? WIFI_AP_STA : WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); // set right after WiFi.begin() per spec
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    DBG_PRINTLN("WiFi connected: " + WiFi.localIP().toString());
-  } else {
-    DBG_PRINTLN("WiFi failed, starting captive portal");
-    startCaptivePortal();
-  }
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // right after begin() per spec
+  DBG_PRINTLN("[WIFI] connecting" + String(apMode ? " (AP still up)" : ""));
 }
 
 void startCaptivePortal() {
   apMode = true;
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(HOSTNAME); // open AP named "chiller" -- TODO: add AP password if desired
+  WiFi.mode(WIFI_AP_STA); // APSTA, not AP: STA must stay available to retry on
+  WiFi.softAP(HOSTNAME); // open AP named "chiller" -- TODO: add AP password
   dnsServer.start(53, "*", WiFi.softAPIP());
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.onNotFound(handleRoot); // catch-all so captive portal detection works
   server.begin();
-  DBG_PRINTLN("Captive portal started, AP IP: " + WiFi.softAPIP().toString());
+  DBG_PRINTLN("[WIFI] captive portal started, AP IP: " + WiFi.softAPIP().toString() +
+              " - will keep retrying the saved network every " +
+              String(WIFI_RETRY_INTERVAL_MS / 1000) + "s");
+}
+
+// Non-blocking connection manager. Called every loop(), before the web server.
+void serviceWifi() {
+  if (wifiReconnectRequested) {
+    wifiReconnectRequested = false;
+    startWifiAttempt();
+    return;
+  }
+
+  if (wifiPhase == WIFI_PHASE_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      onWifiConnected();
+    } else if (millis() - wifiConnectStart >= WIFI_CONNECT_TIMEOUT_MS) {
+      // This attempt gave up. Not fatal - fall back to retrying on the interval.
+      // Drop to the AP if we aren't in it yet, so the user has a way in.
+      DBG_PRINTLN("[WIFI] attempt timed out");
+      wifiPhase = WIFI_PHASE_IDLE;
+      if (!apMode) startCaptivePortal();
+    }
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // Came up without us starting the phase (e.g. the AP scan finished).
+    if (wifiPhase != WIFI_PHASE_CONNECTED) onWifiConnected();
+    return;
+  }
+
+  // Idle and not connected - retry on the interval. This runs whether or not
+  // the AP is up, which is the point: the old code only retried in the
+  // !apMode branch, so once the captive portal started nothing ever retried
+  // again and the device needed a power cycle to get back on the network.
+  if (millis() - lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS) {
+    startWifiAttempt();
+  }
 }
 
 void setupOTA() {
@@ -699,14 +1040,27 @@ void handleRoot() {
   }
 }
 
+// Save new credentials and reconnect without rebooting. The reboot used to be
+// the only way back onto the network after a portal visit; with the retry
+// state machine in place we can just reconnect, which keeps the running chiller
+// uninterrupted. The response is written to the socket first, and the actual
+// attempt is deferred to the next loop() via a flag, so there is no delay()
+// stalling the interlock.
 void handleSave() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   if (ssid.length() > 0) {
     saveSettings(ssid, pass);
-    server.send(200, "text/html", "Saved. Rebooting...");
-    delay(500);
-    ESP.restart();
+    server.send(200, "text/html",
+                "<!doctype html><meta name=viewport content='width=device-width'>"
+                "<body style='font-family:sans-serif;padding:2em'>"
+                "<h2>Saved</h2><p>Connecting to " + ssid + "...</p>"
+                "<p>This page will not update. Reconnect to your normal network "
+                "and browse to <b>http://" HOSTNAME ".local</b> or the IP shown "
+                "in the serial log.</p>"
+                "<p>The access point stays up while it retries, so you can come "
+                "back here if it does not connect.</p>");
+    wifiReconnectRequested = true;
   } else {
     server.send(400, "text/plain", "Missing SSID");
   }
@@ -739,14 +1093,33 @@ void handleStatusJson() {
   json += "\"capSeq\":\"" + String(capSeqName()) + "\",";
   json += "\"capArmed\":" + String(capSeq != CAP_SEQ_WAIT_DISCHARGE ? "true" : "false") + ",";
   json += "\"capAdc\":" + String(capAdcValue) + ",";
+  json += "\"capVolts\":" + String(adcToVolts(capAdcValue), 2) + ",";
   json += "\"capDischargedMax\":" + String(CAP_DISCHARGED_ADC_MAX) + ",";
   json += "\"capChargedMin\":" + String(CAP_CHARGED_ADC_MIN) + ",";
+  json += "\"capDischargedVolts\":" + String(adcToVolts(CAP_DISCHARGED_ADC_MAX), 2) + ",";
+  json += "\"capChargedVolts\":" + String(adcToVolts(CAP_CHARGED_ADC_MIN), 2) + ",";
   json += "\"capCharge\":" + String(digitalRead(PIN_CAP_CHARGE) == HIGH ? "true" : "false") + ",";
+  json += "\"capDischarging\":" + String(capDischargeTiming ? "true" : "false") + ",";
+  json += "\"capDischargeMs\":" + String(capDischargeTiming ? (millis() - capDischargeStart) : 0) + ",";
+  json += "\"capLastDischargeMs\":" + String(lastCapDischargeMs) + ",";
+  json += "\"compressorRunMs\":" + String(compressorRunning ? (millis() - compressorRunStart) : 0) + ",";
+  // A non-zero stop request means the contacts are held closed for the off-delay
+  // even though demand is gone. The UI shows the countdown so the hold is visible
+  // rather than looking like the switch was ignored.
+  json += "\"compressorStopPending\":" + String(compressorStopRequestedAt != 0 ? "true" : "false") + ",";
+  json += "\"compressorOffDelayRemaining\":" + String(
+      (compressorStopRequestedAt != 0 &&
+       millis() - compressorStopRequestedAt < COMPRESSOR_OFF_DELAY_MS)
+        ? (COMPRESSOR_OFF_DELAY_MS - (millis() - compressorStopRequestedAt)) : 0) + ",";
   json += "\"currentAdc\":" + String(currentAdcValue) + ",";
+  json += "\"currentVolts\":" + String(currentAdcToVolts(currentAdcValue), 2) + ",";
   json += "\"currentLimit\":" + String(COMPRESSOR_SAFE_ADC_MAX) + ",";
+  json += "\"currentLimitVolts\":" + String(currentAdcToVolts(COMPRESSOR_SAFE_ADC_MAX), 2) + ",";
   json += "\"currentSafe\":" + String(is12VCurrentSafe() ? "true" : "false") + ",";
   json += "\"fan\":" + String(digitalRead(PIN_FAN) == HIGH ? "true" : "false") + ",";
   json += "\"buzzer\":" + String(digitalRead(PIN_BUZZER) == HIGH ? "true" : "false") + ",";
+  json += "\"buzzerHz\":" + String(buzzerFrequency) + ",";
+  json += "\"buzzerToneActive\":" + String(buzzerToneActive ? "true" : "false") + ",";
   json += "\"enable12v\":" + String(digitalRead(PIN_12V_EN) == HIGH ? "true" : "false") + ",";
   json += "\"enable12vHold\":" + String(pumpOffTimerActive ? "true" : "false") + ",";
   json += "\"compressor\":" + String(digitalRead(PIN_COMPRESSOR) == HIGH ? "true" : "false") + ",";
@@ -804,6 +1177,77 @@ void handleTestCompressor() {
 }
 
 // =========================================================================
+// SETTINGS ENDPOINTS
+// Capacitor thresholds are accepted in VOLTS from the UI and converted here,
+// so the conversion happens once, in one place, on the authoritative side.
+// The resulting ADC counts are what the interlock actually uses.
+// =========================================================================
+void handleSetThresholds() {
+  if (!server.hasArg("vdischarged") || !server.hasArg("vcharged")) {
+    server.send(400, "text/plain", "need vdischarged and vcharged");
+    return;
+  }
+
+  int newDischarged = voltsToAdc(server.arg("vdischarged").toFloat());
+  int newCharged    = voltsToAdc(server.arg("vcharged").toFloat());
+
+  // Enforce the hysteresis band. Without this, setting the two thresholds
+  // equal or inverted would let a charged capacitor satisfy the "discharged"
+  // test, and the contacts could close on a charged cap - defeating the whole
+  // interlock. Refuse the change rather than silently clamping.
+  if (newCharged - newDischarged < CAP_THRESHOLD_MIN_GAP) {
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "rejected: charged must exceed discharged by at least %d counts (%.2fV)",
+             CAP_THRESHOLD_MIN_GAP, adcToVolts(CAP_THRESHOLD_MIN_GAP));
+    server.send(400, "text/plain", msg);
+    return;
+  }
+
+  CAP_DISCHARGED_ADC_MAX = newDischarged;
+  CAP_CHARGED_ADC_MIN   = newCharged;
+  saveThresholds();
+  server.send(200, "text/plain", "ok");
+}
+
+// 12V current-sense overcurrent limit, accepted in volts. Converted here so the
+// authoritative value the gate uses stays in raw ADC counts.
+void handleSetCurrentLimit() {
+  if (!server.hasArg("volts")) {
+    server.send(400, "text/plain", "need volts");
+    return;
+  }
+  int newLimit = currentVoltsToAdc(server.arg("volts").toFloat());
+  if (newLimit < 1) newLimit = 1; // a limit of 0 counts would never be safe
+  COMPRESSOR_SAFE_ADC_MAX = newLimit;
+  prefs.begin("chiller", false);
+  prefs.putInt("adcmax", COMPRESSOR_SAFE_ADC_MAX);
+  prefs.end();
+  server.send(200, "text/plain", "ok");
+}
+
+void handleSetBuzzer() {
+  if (server.hasArg("hz")) {
+    int hz = server.arg("hz").toInt();
+    if (hz < BUZZER_FREQ_MIN || hz > BUZZER_FREQ_MAX) {
+      char msg[80];
+      snprintf(msg, sizeof(msg), "rejected: hz must be %d-%d", BUZZER_FREQ_MIN, BUZZER_FREQ_MAX);
+      server.send(400, "text/plain", msg);
+      return;
+    }
+    buzzerFrequency = hz;
+    // Re-issue the tone if one is currently running, so the new frequency
+    // takes effect immediately rather than at the next on/off transition.
+    if (buzzerToneActive) {
+      noTone(PIN_BUZZER);
+      tone(PIN_BUZZER, buzzerFrequency);
+    }
+    saveBuzzerFrequency();
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// =========================================================================
 // FLASH-PERSISTED SETTINGS
 // =========================================================================
 void loadSettings() {
@@ -811,6 +1255,33 @@ void loadSettings() {
   cfgSsid = prefs.getString("ssid", MYSSIDIOT);
   cfgPass = prefs.getString("pass", MYPSKIOT);
   COMPRESSOR_SAFE_ADC_MAX = prefs.getInt("adcmax", COMPRESSOR_SAFE_ADC_MAX);
+  CAP_DISCHARGED_ADC_MAX  = prefs.getInt("capdis", CAP_DISCHARGED_ADC_MAX);
+  CAP_CHARGED_ADC_MIN    = prefs.getInt("capchg", CAP_CHARGED_ADC_MIN);
+  buzzerFrequency        = prefs.getInt("buzzerhz", buzzerFrequency);
+  prefs.end();
+
+  // A corrupted or hand-edited flash value must not be able to collapse the
+  // hysteresis band, so re-assert the band here as well as on write.
+  if (CAP_CHARGED_ADC_MIN - CAP_DISCHARGED_ADC_MAX < CAP_THRESHOLD_MIN_GAP) {
+    DBG_PRINTLN("[SETTINGS] stored capacitor thresholds violate the hysteresis band, reverting to defaults");
+    CAP_DISCHARGED_ADC_MAX = 500;
+    CAP_CHARGED_ADC_MIN   = 3000;
+  }
+  if (buzzerFrequency < BUZZER_FREQ_MIN || buzzerFrequency > BUZZER_FREQ_MAX) {
+    buzzerFrequency = 2000;
+  }
+}
+
+void saveThresholds() {
+  prefs.begin("chiller", false);
+  prefs.putInt("capdis", CAP_DISCHARGED_ADC_MAX);
+  prefs.putInt("capchg", CAP_CHARGED_ADC_MIN);
+  prefs.end();
+}
+
+void saveBuzzerFrequency() {
+  prefs.begin("chiller", false);
+  prefs.putInt("buzzerhz", buzzerFrequency);
   prefs.end();
 }
 

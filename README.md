@@ -71,15 +71,44 @@ Do not add any other `digitalWrite()` calls on GPIO1 or GPIO8 anywhere else in
 the sketch - all control must go through `updateCompressorInterlock()`. The
 12V enable output (GPIO7) is written in exactly one place, `update12VEnable()`.
 
-### GPIO0 warning
+### Strapping pins (GPIO2, GPIO8, GPIO9) - read this before first power-up
 
-GPIO0 is an ESP32-C3 **strapping** pin: held LOW at reset it forces the chip
-into the ROM downloader, and it skips normal boot entirely. A capacitor-sense
-divider idles LOW whenever the capacitor is discharged, which is the normal
-resting state - so as wired this would drop the board into the bootloader on
-most power-ups. Confirm the sense divider's idle level, or move
-`PIN_CAP_SENSE` to a non-strapping ADC1 pin (GPIO1, 3 or 4, if you can free
-one up).
+The ESP32-C3 has exactly three strapping pins: **GPIO2, GPIO8 and GPIO9**. (This
+is *not* the original ESP32's set - **GPIO0 is not a strapping pin on the C3**,
+so `PIN_CAP_SENSE` on GPIO0 is fine and needs no change. GPIO0 boot-strapping is
+original-ESP32 behavior.)
+
+The C3 datasheet boot table requires:
+
+| Pin | Used as | Requirement at reset |
+|-----|---------|----------------------|
+| GPIO2 | `PIN_ADC_12V` (12V current sense) | must read **1** for *both* SPI boot and download boot |
+| GPIO8 | `PIN_COMPRESSOR` | "don't care" for SPI boot, so driving it LOW at boot is safe |
+| GPIO9 | `PIN_5V_EN` | **1** for SPI boot; **0** forces UART download mode |
+
+Two things to check on the bench, with the circuits actually attached, on a
+real cold power-cycle (brownout/reset is also a strapping sample point):
+
+1. **GPIO2 is the one to worry about.** A 12V current-sense line typically
+   idles LOW with no current flowing - no drop across the sense element. But
+   GPIO2 must latch `1` at reset on the C3, so a sense output that rests LOW
+   may prevent normal boot. Measure GPIO2's resting voltage during a cold boot.
+   If it rests low, `PIN_ADC_12V` has to move to a non-strapping ADC1 pin
+   (GPIO0, 1, 3 or 4 - whichever you can free up).
+2. **Nothing external may pull GPIO9 low** before the sketch runs (no pull-down
+   on that MOSFET/relay gate net), or the chip drops into UART download mode
+   instead of booting. `PIN_5V_EN` defaulting HIGH is the correct direction.
+   Note the SuperMini's BOOT button pulls GPIO9 to ground, and that board's
+   onboard status LED sits on GPIO8 (active low), so the compressor output
+   will mirror onto that LED.
+
+### 12V enable during capacitor charging
+
+`update12VEnable()` keeps the 12V enable pin (GPIO7) on while the compressor is
+running. It does **not** stay on during the `CHARGING` phase, because the
+capacitor is charged straight from GPIO1 through a diode and does not need the
+12V rail. If that ever changes, the call site in `loop()` is where to hold the
+rail through charging.
 
 ## Mode switch behavior
 
@@ -99,6 +128,135 @@ If the switch reads zero or more than one position active at once
 (wiring fault, transition glitch), the firmware fails safe to OFF. With
 position 1 unwired, the only way to reach OFF is that fail-safe path.
 
+
+## Buzzer output
+
+The buzzer is driven as a **pulsed square wave** at `buzzerFrequency` (via
+`tone()`, LEDC-backed) and is never held at a static DC level. A piezo element
+produces no sound from DC, and a magnetic buzzer will overheat if held on one.
+
+`tone()`/`noTone()` are only called on an actual on/off transition, never once
+per loop, so the pulsing costs a single boolean compare per iteration and does
+not disturb the safety-critical path. The frequency is settable from the web UI
+(100-8000 Hz, default 2000) and is persisted to flash. Changing it while a tone
+is running re-issues the tone immediately rather than waiting for the next
+on/off transition.
+
+## Calibration inputs (volts + raw ADC)
+
+The web UI has a **Calibration** section with an input per threshold, and the
+status page shows the volts figure **and** the raw ADC count side by side for
+both analog inputs. The point of showing both is that the ADC count is what the
+interlock actually gates on, so you can sanity-check the conversion rather than
+having to trust it.
+
+| Input | Setting | JSON | Key |
+| --- | --- | --- | --- |
+| Capacitor discharged at/below | volts | `capDischargedVolts` | `capdis` |
+| Capacitor charged at/above | volts | `capChargedVolts` | `capchg` |
+| 12V current overcurrent limit | volts | `currentLimitVolts` | `adcmax` |
+| Buzzer frequency | Hz | `buzzerHz` | `buzzerhz` |
+
+Endpoints: `/set/thresholds?vdischarged=&vcharged=`, `/set/current?volts=`,
+`/set/buzzer?hz=`. Volts are converted once on the device, so the stored and
+authoritative values remain raw ADC counts.
+
+Each analog input has its own scaling constant, because the two sensing paths are
+not the same circuit:
+
+- `CAP_SENSE_DIVIDER` = `1.0` - GPIO0 sees capacitor voltage directly (1k
+  series, no divider).
+- `CURRENT_SENSE_DIVIDER` = `1.0` - **UNCALIBRATED PLACEHOLDER.** GPIO2 goes
+  through a sense amplifier, and this is the factor that turns pin voltage back
+  into real 12V rail current. Until you measure it against a known load, the
+  12V volts readout is just the pin voltage. The UI labels it *uncalibrated*.
+
+The C3's ADC is measurably nonlinear, especially near the rails, so treat volts
+as **indicative** and calibrate against a multimeter. A volts error can only
+mis-set a threshold, never make the interlock unsafe.
+
+The hysteresis band on the capacitor pair is enforced on every write and on every
+load. A new pair is rejected unless the charged threshold exceeds the discharged
+one by at least `CAP_THRESHOLD_MIN_GAP` (200 counts, ~0.16V). This is not
+defensive decoration: with the two equal or inverted, a *charged* capacitor would
+satisfy the "discharged" test and the contacts could close on a charged
+capacitor, defeating the interlock entirely. `loadSettings()` re-asserts the band
+so a corrupted or hand-edited flash value cannot collapse it either.
+
+The current limit has no such guard because a limit of 0 counts would be *more*
+conservative, not less, so it is merely floored at 1 count.
+
+### Why the charge output is parked LOW while waiting to discharge
+
+In `WAIT_DISCHARGE` the charge output is written LOW **unconditionally, before**
+the re-arm test - not inside it. That ordering is the whole point.
+
+A run can be requested while the capacitor is still charged, and that is the
+normal case after any stop. If the charge output were left energised while
+waiting, it would hold the capacitor at the charged voltage, the `cap <=
+CAP_DISCHARGED_ADC_MAX` test would never be satisfied, and the compressor would
+**never run again**. Parking it LOW is what lets the capacitor bleed down to the
+discharged threshold so the start can arm. Requesting a run is not sufficient on
+its own: the capacitor has to actually be seen discharged.
+
+## Timers
+
+Two live counters, both reported in `/status` and on the status page:
+
+- **Compressor run time** - how long the contacts have been closed this run.
+  Resets on every start. During a minimum-run or off-delay hold the compressor
+  stays closed after demand is removed, so this counter keeps running through
+  both holds and only stops when the contacts actually open. A **stop pending**
+  countdown shows how much off-delay is left, so the hold is visible rather than
+  looking like the switch was ignored.
+- **Capacitor discharge time** - how long the capacitor has been sitting below
+  `CAP_CHARGED_ADC_MIN`, i.e. how long it has been bleeding down since it last
+  read charged. Restarts each time the capacitor rises back above that
+  threshold, and the last completed measurement is retained. This is a health
+  indicator for the discharge path: a capacitor that never bleeds down points at
+  a failed bleeder, and would block the next start.
+
+The discharge timer is currently a **measurement only** - it is not compared
+against a limit and does not raise a fault. Wiring a `CAP_MAX_DISCHARGE_MS`
+limit onto it would catch a failed bleeder automatically; that was left out
+deliberately rather than picking an uncalibrated trip point.
+
+## Compressor minimum run time and off-delay
+
+Two separate holds, and the distinction matters:
+
+- `COMPRESSOR_MIN_RUN_MS` (placeholder: 5s) - once the contacts close they stay
+  closed for at least this long.
+- `COMPRESSOR_OFF_DELAY_MS` (placeholder: 5s) - after that minimum is satisfied,
+  removing demand does **not** open the contacts straight away. They stay closed
+  for a further `COMPRESSOR_OFF_DELAY_MS`.
+
+The contacts open only when **both** have elapsed.
+
+**Why they have to be two constants.** A minimum run time on its own cannot give
+you the seamless resume. Once a compressor has been running longer than the
+minimum, removing demand satisfies "minimum elapsed" on the very first loop, so
+the contacts open immediately. Flipping the switch back to chiller then starts
+from `WAIT_DISCHARGE` and has to bleed the capacitor down and re-charge it - a
+full contactor cycle, which is exactly what you are trying to avoid.
+
+With the off-delay, the sequence runs like this:
+
+1. Compressor has been running longer than the minimum.
+2. Switch to OFF. `compressorStopRequestedAt` is stamped, contacts stay closed,
+   capacitor stays charged. The UI shows a "stop pending" countdown.
+3. Switch back to chiller inside the window. `compressorStopRequestedAt` is
+   cleared to 0, the state is still `RUNNING`, and the compressor just carries
+   on - no stop, no discharge, no re-charge, no contactor cycle. The program
+   recognises it was still running.
+
+If demand does *not* return, the contacts open when the off-delay expires and the
+next start re-arms from a discharged capacitor as normal.
+
+Overcurrent is tested **before** both holds, so a 12V current-sense trip still
+opens the contacts on the very next loop with no delay. A latched fault also
+overrides everything and forces both outputs off. Neither hold can delay a
+safety trip.
 
 ## Pump anti-short-cycle delay
 
@@ -125,19 +283,44 @@ This is a strip-wide single-color scheme for now - see the TODO in
 
 ## Web UI
 
-Connect to `http://chiller.local/` (or the device IP) for a live status
-page that polls `/status` (JSON) every second. Every row shows the raw GPIO
-number and pin level next to its label (e.g. `Compressor  8=LOW`), read
-straight from `digitalRead()` so what you see is the actual pin, not just the
-derived flag. Rows cover: mode, state, capacitor sequence phase and arm state,
-capacitor reading against both thresholds, charge output, 12V current reading
-against its limit, latched fault, fan/buzzer/12V-enable/compressor outputs,
-and all 4 switch positions.
+Connect to `http://chiller.local/` (or the device IP) for a live status page
+that polls `/status` (JSON) every second.
 
-Manual test controls are provided for:
+**Switch dial.** A dial graphic at the top mirrors the physical 4-position
+switch: **up = 1 (off), right = 2 (pump), down = 3 (chiller), left = 4 (both)**.
+The needle animates to the debounced active position, the active position number
+is highlighted, and the mode is shown beside it. If the firmware reads zero or
+more than one position active it is in the failsafe-OFF state, so the needle
+greys out and the panel reads `none / failsafe OFF` - the dial will show that
+rather than a false position. Position 1 renders dimmed as unwired.
+
+**Mode colors** match the status LED colors exactly, so the two always agree:
+OFF = grey, pump only = blue, chiller only = orange, both = purple. The color is
+applied to the Mode row in the table and to the mode readout beside the dial.
+
+Every row also shows the raw GPIO number and pin level next to its label (e.g.
+`Compressor  8=LOW`), read straight from `digitalRead()` so what you see is the
+actual pin, not just the derived flag. Rows cover: mode, state, capacitor
+sequence phase and arm state, capacitor reading in volts and ADC against both
+thresholds, charge output, live discharge timer, 12V current reading against its
+limit, latched fault, fan/buzzer/12V-enable/compressor outputs, compressor run
+timer, and all 4 switch positions.
+
+**Settings** (both persisted to flash):
+
+- Capacitor thresholds, entered in volts, shown next to the raw ADC count.
+- 12V current-sense overcurrent limit, entered in volts, shown next to the raw
+  ADC count. Marked *uncalibrated* until `CURRENT_SENSE_DIVIDER` is measured.
+- Buzzer test frequency in Hz.
+
+Form fields are not overwritten by the 1s poll while you have them focused, so
+a refresh can't clobber what you're typing. A rejected threshold change reports
+the reason from the device instead of silently clamping.
+
+Manual test controls:
 
 - Fan on/off/auto
-- Buzzer on/off/auto
+- Buzzer on/off/auto - pulsed, at the configured frequency
 - Compressor demand on/off/auto - this only sets the *demand* flag. It still
   passes through the full capacitor interlock and the current-sense gate every
   loop, so it can be used to verify the interlock itself without ever bypassing
@@ -164,6 +347,21 @@ and precharge timeouts.
   `/` where new credentials can be entered and saved.
 - Reconnection is attempted automatically in `loop()` on a
   `WIFI_RETRY_INTERVAL_MS` timer, without blocking other logic.
+- **Retries keep running while the captive portal is up.** The AP is brought up in
+  `WIFI_AP_STA` mode, so the station half stays active and keeps retrying the saved
+  network every `WIFI_RETRY_INTERVAL_MS`. When the network comes back, the device
+  tears the AP down, swaps the portal's catch-all route for the real status routes,
+  and carries on. The serial log shows `[WIFI] connecting` every interval while it
+  is retrying, and `[WIFI] connected` with the IP when it lands.
+- **Connection is fully non-blocking.** `WiFi.begin()` is issued and then polled
+  from `loop()`; nothing waits for `WL_CONNECTED` in a loop. The previous
+  implementation blocked for up to `WIFI_CONNECT_TIMEOUT_MS` (10s) per attempt -
+  and `loop()` is what runs the compressor interlock, so every retry would have
+  delayed a 12V overcurrent trip by up to 10s with the contacts held closed.
+  There is no `delay()` and no `ESP.restart()` anywhere in the runtime path.
+- Saving new credentials in the portal no longer reboots the device. It stores them
+  and immediately attempts a connection, so a running chiller is not interrupted
+  just to change WiFi settings.
 
 ## Files
 
@@ -174,22 +372,44 @@ and precharge timeouts.
 
 ## TODO / left for calibration
 
-- `CAP_DISCHARGED_ADC_MAX` (500) and `CAP_CHARGED_ADC_MIN` (3000) are
-  placeholders and must be calibrated against the real capacitor charge curve.
-  Keep a wide gap between them - that gap is the hysteresis band, and a narrow
-  one risks chatter around a threshold in the noise.
+- `CAP_DISCHARGED_ADC_MAX` (0.40V) and `CAP_CHARGED_ADC_MIN` (2.42V) defaults
+  need calibration against the real capacitor charge curve. Keep a wide gap
+  between them - that gap is the hysteresis band, and a narrow one risks chatter
+  around a threshold in the noise.
 - `COMPRESSOR_SAFE_ADC_MAX` placeholder (500) needs calibration against the
-  real 12V current-sense curve.
-- `PRECHARGE_TIMEOUT_MS` and `FAULT_RESET_HOLD_MS` are guesses.
-- **Resolve the GPIO0 strapping conflict** - see the warning above.
-- `PIN_SWITCH_1` is unwired; assign a real pin if position 1 (OFF) is needed as
-  a deliberate selection rather than only via the fail-safe path.
-- Debounce on switch position change (and on the timer input).
-- Active level / debounce for the timer input.
+  real 12V current-sense curve, **and** `CURRENT_SENSE_DIVIDER` needs a measured
+  ratio so the volts readout means anything. Measure the GPIO2 pin voltage at a
+  known 12V load current, set the constant, then set the overcurrent limit in
+  volts from the UI.
+- Verify the pulsed buzzer actually sounds on hardware - the `tone()`/LEDC path
+  should be confirmed once on the real board.
+- **Overcurrent is not a latched fault.** A 12V current-sense trip just opens the
+  contacts; a *persistent* overcurrent will therefore keep retrying (slowly -
+  each attempt needs a fresh capacitor discharge). Decide whether a sustained
+  overcurrent should latch and require manual recovery.
+- `PRECHARGE_TIMEOUT_MS`, `COMPRESSOR_MIN_RUN_MS`, `COMPRESSOR_OFF_DELAY_MS` and
+  `FAULT_RESET_HOLD_MS` are guesses.
+- **Verify the strapping pins on a cold boot** - especially GPIO2, which must
+  latch HIGH. See the strapping section above.
+- `PIN_SWITCH_1` is unwired, so OFF is not a deliberate switch position - it is
+  only reachable via the "0-or-2+-active" fail-safe path. Confirm that is what
+  you want long-term, or assign a real pin.
+- Debounce is implemented per switch input at `SWITCH_DEBOUNCE_MS` (500 ms) -
+  a raw reading must be stable that long before it is acted on. Tune to taste;
+  too long feels laggy, too short defeats the purpose. The timer input is
+  **not** debounced yet.
+- `PIN_TIMER_IN` now has an explicit `INPUT_PULLDOWN` so it can never float
+  into `compressorRequested`, but the active level is still unconfirmed. With the
+  pull-down an unwired timer reads inactive, which blocks chiller demand - so if
+  that timer is not actually wired, the compressor will never run.
 - Confirm whether the timer input should gate/AND with the switch mode for
   compressor demand, or be removed/repurposed now that the switch exists.
-- `LED_COUNT` is a placeholder - set it to the actual strip length.
-- Per-LED status mapping instead of single strip-wide color.
+- `LED_COUNT` is a placeholder - set it to the actual strip length.- Per-LED status mapping instead of single strip-wide color.
 - Fan/buzzer have no automatic behaviour at all yet - they are manual-test
   outputs only. They need real demand logic.
+- Optionally add a `CAP_MAX_DISCHARGE_MS` limit so a capacitor that never bleeds
+  down (failed bleeder) latches a fault instead of only being reported.
+- The dial needle is repositioned via the SVG `transform` attribute, so it snaps
+  rather than animating between positions. Cosmetic only. The selected position is
+  marked by an arrow plus an enlarged number.
 - Live status page could add a timer input row and mode override.
