@@ -381,12 +381,19 @@ void setup() {
   // ---- GPIO defaults: ALL outputs LOW at boot, except 5V enable = HIGH ----
   // The charge output must be LOW at boot: the capacitor starts discharged
   // and must not be energized until the interlock routine decides to.
-  pinMode(PIN_FAN, OUTPUT);        digitalWrite(PIN_FAN, LOW);
-  pinMode(PIN_BUZZER, OUTPUT);     digitalWrite(PIN_BUZZER, LOW);
-  pinMode(PIN_12V_EN, OUTPUT);     digitalWrite(PIN_12V_EN, LOW);   // 12V rail off at boot
-  pinMode(PIN_COMPRESSOR, OUTPUT); digitalWrite(PIN_COMPRESSOR, LOW);
-  pinMode(PIN_CAP_CHARGE, OUTPUT); digitalWrite(PIN_CAP_CHARGE, LOW); // no charging at boot
-  pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);   // default HIGH per spec
+  //
+  // Every output level is written BEFORE the pin is switched to OUTPUT, so the
+  // pin never drives an unintended level during the mode change. Order matters:
+  // do not collapse these back into "pinMode() then digitalWrite()".
+  digitalWrite(PIN_FAN, LOW);        pinMode(PIN_FAN, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);     pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_12V_EN, LOW);     pinMode(PIN_12V_EN, OUTPUT);   // 12V rail off at boot
+  digitalWrite(PIN_COMPRESSOR, LOW); pinMode(PIN_COMPRESSOR, OUTPUT);
+  digitalWrite(PIN_CAP_CHARGE, LOW); pinMode(PIN_CAP_CHARGE, OUTPUT); // no charging at boot
+  // GPIO9 is an ESP32-C3 strapping pin: it must be HIGH for SPI boot, and LOW
+  // forces UART download mode. It is parked HIGH (still set before enabling the
+  // output) and must never be moved to LOW here.
+  digitalWrite(PIN_5V_EN, HIGH);     pinMode(PIN_5V_EN, OUTPUT);
   pinMode(PIN_CAP_SENSE, INPUT);   // analog: capacitor voltage sense
   pinMode(PIN_ADC_12V, INPUT);     // analog: 12V current sense
   // Timer input is treated as active-HIGH (see applyMode()). Configured with
